@@ -1,0 +1,292 @@
+---
+title: "DDD Building Blocks: Entities, Aggregates, and Value Objects"
+sidebarTitle: "Overview"
+description: "MASA Framework DDD building blocks give you Entity, AggregateRoot, ValueObject, DomainService, and IRepository abstractions for domain modeling in .NET."
+---
+
+MASA Framework ships a complete set of Domain-Driven Design building blocks that let you model your business domain using well-established patterns. The abstractions live in `Masa.BuildingBlocks.Ddd.Domain` — a package with no infrastructure dependencies — so your domain model stays clean, portable, and testable regardless of which database or transport technology you choose.
+
+## Installation
+
+```bash
+dotnet add package Masa.BuildingBlocks.Ddd.Domain
+```
+
+For the EF Core repository implementation (required at runtime), also add:
+
+```bash
+dotnet add package Masa.Contrib.Ddd.Domain.Repository.EFCore
+```
+
+---
+
+## Entity
+
+`Entity` is the abstract base for any object whose identity is defined by its key(s) rather than its attribute values. It implements `IEntity`, `IEquatable<Entity>`, and `IEquatable<object>`.
+
+<ParamField path="GetKeys()" type="abstract IEnumerable<(string Name, object Value)>">
+  Returns the key name-value pairs that uniquely identify this entity. Used for structural equality and `ToString()`.
+</ParamField>
+
+The `Entity<TKey>` generic subclass adds a typed `Id` property and a default `GetKeys()` implementation that returns `("Id", Id)`.
+
+```csharp
+public abstract class Entity : IEntity, IEquatable<Entity>
+{
+    public abstract IEnumerable<(string Name, object Value)> GetKeys();
+
+    public override bool Equals(object? obj) { /* compares key sequences */ }
+    public static bool operator ==(Entity? x, Entity? y) { /* ... */ }
+    public static bool operator !=(Entity? x, Entity? y) { /* ... */ }
+}
+
+public abstract class Entity<TKey> : Entity, IEntity<TKey>
+{
+    public TKey Id { get; protected set; } = default!;
+
+    protected Entity(TKey id) : this() => Id = id;
+
+    public override IEnumerable<(string Name, object Value)> GetKeys()
+    {
+        yield return ("Id", Id!);
+    }
+}
+```
+
+**Usage example:**
+
+```csharp
+public class OrderItem : Entity<Guid>
+{
+    public string ProductId { get; private set; } = string.Empty;
+    public int Quantity { get; private set; }
+
+    public OrderItem(Guid id, string productId, int quantity) : base(id)
+    {
+        ProductId = productId;
+        Quantity = quantity;
+    }
+}
+```
+
+---
+
+## AggregateRoot
+
+`AggregateRoot` extends `Entity` and adds domain event management via `IGenerateDomainEvents`. It maintains an internal `_domainEvents` list that is populated during domain operations and flushed by the Unit of Work before committing.
+
+| Method | Description |
+|--------|-------------|
+| `AddDomainEvent(IDomainEvent)` | Appends a domain event to the internal queue |
+| `RemoveDomainEvent(IDomainEvent)` | Removes a specific event from the queue |
+| `GetDomainEvents()` | Returns the current queued events (read-only) |
+| `ClearDomainEvents()` | Empties the event queue (called automatically by the UoW) |
+
+`AggregateRoot<TKey>` provides the typed `Id` property from `Entity<TKey>`.
+
+```csharp
+public class Order : AggregateRoot<Guid>
+{
+    private readonly List<OrderItem> _items = new();
+    public IReadOnlyList<OrderItem> Items => _items.AsReadOnly();
+    public string Status { get; private set; } = "Pending";
+
+    public Order(Guid id) : base(id) { }
+
+    public void AddItem(OrderItem item)
+    {
+        _items.Add(item);
+        AddDomainEvent(new OrderItemAddedEvent(Id, item));
+    }
+}
+```
+
+---
+
+## ValueObject
+
+`ValueObject` is the base for objects whose identity is defined entirely by their attribute values — two instances with the same values are equal. Implement `GetEqualityValues()` to declare which properties participate in equality.
+
+```csharp
+public class Money : ValueObject
+{
+    public decimal Amount { get; }
+    public string Currency { get; }
+
+    public Money(decimal amount, string currency)
+    {
+        Amount = amount;
+        Currency = currency;
+    }
+
+    protected override IEnumerable<object> GetEqualityValues()
+    {
+        yield return Amount;
+        yield return Currency;
+    }
+}
+
+// Value equality — no identity comparison needed
+var price1 = new Money(9.99m, "USD");
+var price2 = new Money(9.99m, "USD");
+Console.WriteLine(price1 == price2); // true
+```
+
+---
+
+## Auditing Base Classes
+
+MASA Framework provides pre-built auditing base classes that automatically track who created or modified an entity and when. These work in conjunction with `MasaDbContext` which sets the values on `SaveChangesAsync`.
+
+<CardGroup cols={2}>
+  <Card title="AuditEntity&lt;TKey, TUserId&gt;" icon="user-clock">
+    Entity with `Creator`, `Modifier` (typed `TUserId`), `CreationTime`, and `ModificationTime` properties.
+  </Card>
+  <Card title="AuditAggregateRoot&lt;TKey, TUserId&gt;" icon="shield-check">
+    Same auditing as above, but extends `AggregateRoot` so it also supports domain events.
+  </Card>
+  <Card title="FullEntity&lt;TKey, TUserId&gt;" icon="trash-clock">
+    Extends `AuditEntity` with `IsDeleted` for soft-delete support.
+  </Card>
+  <Card title="FullAggregateRoot&lt;TKey, TUserId&gt;" icon="layer-group">
+    Extends `AuditAggregateRoot` with `IsDeleted` — the most complete base class.
+  </Card>
+</CardGroup>
+
+```csharp
+// Entity with full auditing and soft-delete, keyed by Guid with Guid user ID
+public class Product : FullAggregateRoot<Guid, Guid>
+{
+    public string Name { get; private set; } = string.Empty;
+    public decimal Price { get; private set; }
+
+    // Inherited: Id, Creator, CreationTime, Modifier, ModificationTime, IsDeleted
+
+    public Product(Guid id, string name, decimal price) : base(id)
+    {
+        Name = name;
+        Price = price;
+    }
+}
+```
+
+---
+
+## IRepository&lt;TEntity&gt;
+
+`IRepository<TEntity>` is the generic repository contract. The EF Core implementation is automatically registered when you call `AddDomainEventBus()` after setting up `MasaDbContext`.
+
+### Write operations
+
+```csharp
+ValueTask<TEntity> AddAsync(TEntity entity, CancellationToken cancellationToken = default);
+Task AddRangeAsync(IEnumerable<TEntity> entities, CancellationToken cancellationToken = default);
+
+Task<TEntity> UpdateAsync(TEntity entity, CancellationToken cancellationToken = default);
+Task UpdateRangeAsync(IEnumerable<TEntity> entities, CancellationToken cancellationToken = default);
+
+Task<TEntity> RemoveAsync(TEntity entity, CancellationToken cancellationToken = default);
+Task RemoveRangeAsync(IEnumerable<TEntity> entities, CancellationToken cancellationToken = default);
+Task RemoveAsync(Expression<Func<TEntity, bool>> predicate, CancellationToken cancellationToken = default);
+```
+
+### Read operations
+
+```csharp
+Task<TEntity?> FindAsync(IEnumerable<KeyValuePair<string, object>> keyValues, CancellationToken cancellationToken = default);
+Task<TEntity?> FindAsync(Expression<Func<TEntity, bool>> predicate, CancellationToken cancellationToken = default);
+
+Task<IEnumerable<TEntity>> GetListAsync(CancellationToken cancellationToken = default);
+Task<IEnumerable<TEntity>> GetListAsync(Expression<Func<TEntity, bool>> predicate, CancellationToken cancellationToken = default);
+
+Task<long> GetCountAsync(CancellationToken cancellationToken = default);
+Task<long> GetCountAsync(Expression<Func<TEntity, bool>> predicate, CancellationToken cancellationToken = default);
+
+// Paginated queries
+Task<List<TEntity>> GetPaginatedListAsync(int skip, int take, string sortField, bool isDescending = true, CancellationToken cancellationToken = default);
+Task<PaginatedList<TEntity>> GetPaginatedListAsync(PaginatedOptions options, CancellationToken cancellationToken = default);
+```
+
+`IRepository<TEntity, TKey>` extends the base interface with key-typed convenience methods:
+
+```csharp
+Task<TEntity?> FindAsync(TKey id, CancellationToken cancellationToken = default);
+Task RemoveAsync(TKey id, CancellationToken cancellationToken = default);
+Task RemoveRangeAsync(IEnumerable<TKey> ids, CancellationToken cancellationToken = default);
+```
+
+### Custom repositories
+
+Extend `RepositoryBase<TEntity>` to add domain-specific query methods:
+
+```csharp
+public interface IOrderRepository : IRepository<Order, Guid>
+{
+    Task<List<Order>> GetByCustomerAsync(string customerName, CancellationToken cancellationToken = default);
+}
+
+public class OrderRepository : RepositoryBase<Order>, IOrderRepository
+{
+    private readonly ShopDbContext _context;
+
+    public OrderRepository(ShopDbContext context, IServiceProvider serviceProvider)
+        : base(serviceProvider)
+    {
+        _context = context;
+    }
+
+    public override IUnitOfWork UnitOfWork => ServiceProvider.GetRequiredService<IUnitOfWork>();
+
+    public async Task<List<Order>> GetByCustomerAsync(
+        string customerName,
+        CancellationToken cancellationToken = default)
+        => await _context.Orders
+            .Where(o => o.CustomerName == customerName)
+            .ToListAsync(cancellationToken);
+
+    // ... implement remaining abstract members
+}
+```
+
+---
+
+## DomainService
+
+`DomainService` is the base class for stateless domain logic that coordinates multiple aggregates. It receives an `IDomainEventBus` through its constructor or via `SetDomainEventBus()`, which is called automatically during DI registration.
+
+```csharp
+public class OrderDomainService : DomainService
+{
+    private readonly IOrderRepository _orderRepo;
+
+    public OrderDomainService(
+        IDomainEventBus eventBus,
+        IOrderRepository orderRepo) : base(eventBus)
+    {
+        _orderRepo = orderRepo;
+    }
+
+    public async Task CancelOrderAsync(Guid orderId)
+    {
+        var order = await _orderRepo.FindAsync(orderId)
+            ?? throw new InvalidOperationException("Order not found.");
+        order.Cancel(); // raises OrderCancelledEvent internally
+        await _orderRepo.UpdateAsync(order);
+    }
+}
+```
+
+Register all domain services by calling `AddDomainEventBus()`:
+
+```csharp
+builder.Services.AddDomainEventBus(options =>
+{
+    options.UseEventBus()
+           .UseUoW<ShopDbContext>()
+           .UseIntegrationEventBus();
+});
+```
+
+<Tip>
+  `AddDomainEventBus()` scans all loaded assemblies for `DomainService` subclasses and registers them as scoped services automatically — no manual `AddScoped<MyDomainService>()` calls needed.
+</Tip>

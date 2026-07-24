@@ -1,0 +1,143 @@
+---
+title: "DaprStarter: Auto-Start Dapr Sidecar for Local Development"
+sidebarTitle: "Dapr Starter"
+description: "Masa.Contrib.Development.DaprStarter launches and manages the Dapr sidecar process automatically during local development, eliminating manual dapr run commands."
+---
+
+`Masa.Contrib.Development.DaprStarter` removes the friction of running `dapr run` manually every time you start a service locally. It integrates with the ASP.NET Core hosted-service model so the Dapr sidecar process is automatically launched when your application starts and cleanly stopped when it shuts down — letting you focus on writing code rather than managing infrastructure processes.
+
+<Warning>
+  DaprStarter is designed **exclusively for local development**. In production, the Dapr sidecar is managed by Kubernetes (or another orchestrator) and injecting it via this package will cause conflicts. Remove or conditionally exclude this registration before deploying to any production environment.
+</Warning>
+
+## Installation
+
+Add the ASP.NET Core integration package to your project:
+
+```bash
+dotnet add package Masa.Contrib.Development.DaprStarter.AspNetCore
+```
+
+## How It Works
+
+DaprStarter wires three collaborating abstractions together into the ASP.NET Core lifecycle:
+
+| Component | Responsibility |
+|---|---|
+| `IDaprProcess` | Lifecycle contract — `Start()`, `Stop()`, `Dispose()` |
+| `DaprBackgroundService` | `IHostedService` that calls `Start` on app startup and `Stop` on shutdown |
+| `IAppPortProvider` | Resolves the port your ASP.NET Core app is listening on (auto-detected from Kestrel) |
+| `DefaultAvailabilityPortProvider` | Finds a free OS port for the Dapr HTTP and gRPC sidecar listeners |
+| `CommandLineBuilder` | Assembles the final `dapr run …` command from resolved options |
+| `DaprEnvironmentProvider` | Reads Dapr-related environment variables (e.g. `DAPR_HTTP_PORT`) to blend with code config |
+
+When `DaprBackgroundService` starts, it calls `IDaprProcess.Start()`. The process implementation asks `CommandLineBuilder` to produce the full `dapr run` invocation, spawns the child process, and monitors it for premature exits. On `IHostApplicationLifetime.ApplicationStopping`, `Stop()` is called and the sidecar is terminated gracefully.
+
+## Configuration Options
+
+All options are surfaced through `DaprOptions`:
+
+| Option | Type | Description |
+|---|---|---|
+| `AppId` | `string` | Dapr application ID used for service discovery |
+| `AppPort` | `int?` | Port your app listens on; auto-detected from Kestrel when omitted |
+| `DaprHttpPort` | `int?` | Dapr HTTP sidecar port (defaults to `3500` when unset) |
+| `DaprGrpcPort` | `int?` | Dapr gRPC sidecar port (defaults to `50001` when unset) |
+| `ComponentPath` | `string?` | Path to the folder containing Dapr component YAML files |
+| `Config` | `string?` | Path to a Dapr configuration YAML file |
+| `EnableProfiling` | `bool` | Passes `--enable-profiling` to the sidecar |
+| `LogLevel` | `string?` | Sidecar log level (`debug`, `info`, `warn`, `error`) |
+
+## Registration
+
+### Inline code configuration
+
+```csharp
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddDaprStarter(options =>
+{
+    options.AppId         = "my-service";
+    options.AppPort       = 5000;        // optional — auto-detected if omitted
+    options.DaprHttpPort  = 3500;
+    options.DaprGrpcPort  = 50001;
+    options.ComponentPath = "./dapr/components";
+    options.LogLevel      = "info";
+});
+
+var app = builder.Build();
+app.Run();
+```
+
+`AppPort` is optional. When you omit it, `IAppPortProvider` inspects the Kestrel server addresses at startup and picks the first available HTTP port automatically.
+
+### Configuration file
+
+You can drive all options from `appsettings.json` (or environment-specific variants) instead of hardcoding them:
+
+```json
+{
+  "DaprOptions": {
+    "AppId": "my-service",
+    "DaprHttpPort": 3500,
+    "DaprGrpcPort": 50001,
+    "ComponentPath": "./dapr/components",
+    "Config": "./dapr/config.yaml",
+    "LogLevel": "info"
+  }
+}
+```
+
+Then register without a delegate and DaprStarter binds to the `DaprOptions` section automatically:
+
+```csharp
+builder.Services.AddDaprStarter();
+```
+
+Mixing both approaches is supported — code configuration takes precedence over file-based values for any property that is explicitly set.
+
+## Port Auto-Detection
+
+When `AppPort` is not provided, DaprStarter uses `IAppPortProvider` to resolve the Kestrel listening port at runtime. If Dapr's own ports (`DaprHttpPort`, `DaprGrpcPort`) are also left unset, `DefaultAvailabilityPortProvider` scans for free ephemeral ports and assigns them — useful in environments where default ports may already be in use.
+
+```csharp
+// Minimal registration — all ports resolved automatically
+builder.Services.AddDaprStarter(options =>
+{
+    options.AppId = "my-service";
+});
+```
+
+## Development Workflow
+
+With DaprStarter registered, your typical `dotnet run` or IDE F5 launch is all that is needed:
+
+```bash
+dotnet run --project src/MyService
+# Dapr sidecar is started automatically — no separate terminal required
+```
+
+The generated `dapr run` command is logged at startup so you can inspect the exact flags being used:
+
+```
+info: DaprBackgroundService[0]
+      Starting Dapr sidecar: dapr run --app-id my-service --app-port 5000
+        --dapr-http-port 3500 --dapr-grpc-port 50001
+        --components-path ./dapr/components
+```
+
+## Conditional Registration
+
+To ensure DaprStarter never runs in production, guard the registration with an environment check:
+
+```csharp
+if (builder.Environment.IsDevelopment())
+{
+    builder.Services.AddDaprStarter(options =>
+    {
+        options.AppId = "my-service";
+    });
+}
+```
+
+This is the recommended pattern — it keeps the package in `<PackageReference>` for convenience while preventing any risk of accidental production use.

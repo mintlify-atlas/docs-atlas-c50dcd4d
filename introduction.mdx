@@ -1,0 +1,101 @@
+---
+title: "MASA Framework: Cloud-Native .NET Microservice Framework"
+sidebarTitle: "Introduction"
+description: "MASA Framework is a modular .NET microservice framework providing Dapr-based building blocks for event-driven, DDD, and multi-tenant cloud-native applications."
+---
+
+MASA Framework is a .NET next-generation microservice development framework that delivers cloud-native best practices built on top of the Distributed Application Runtime (Dapr). It lets you compose modern applications — distributed systems, microservices, Domain-Driven Design, and multi-tenant SaaS platforms — from a rich set of independently installable building blocks, without locking your domain logic to any single vendor or technology.
+
+## Two-Layer Architecture
+
+Every capability in MASA Framework is split into two complementary NuGet layers:
+
+- **`Masa.BuildingBlocks.*`** — Pure abstractions: interfaces, base classes, and contracts. Your domain and application code depends only on these packages.
+- **`Masa.Contrib.*`** — Concrete implementations: plug in the provider you need (SQL Server, Redis, Dapr, etc.) and swap it later without touching a single line of domain logic.
+
+This separation means your business code stays clean and technology-agnostic while the infrastructure layer remains fully replaceable.
+
+<Note>
+  Because your service classes depend on `Masa.BuildingBlocks` abstractions, you can swap a `Masa.Contrib` implementation package — for example, switching from SQL Server to PostgreSQL — with just a one-line change in `Program.cs`.
+</Note>
+
+## Why Use MASA Framework?
+
+<CardGroup cols={2}>
+  <Card title="Composable Packages" icon="puzzle-piece">
+    Install only the building blocks you need. Each block is a separate NuGet package; there is no monolithic framework dependency.
+  </Card>
+  <Card title="Dapr Integration" icon="cloud">
+    First-class Dapr support for service invocation, pub/sub integration events, distributed state, and secret management.
+  </Card>
+  <Card title="Swap Implementations Freely" icon="arrows-rotate">
+    Abstractions in `Masa.BuildingBlocks` mean you change a Contrib package, not your domain code, when switching databases or message brokers.
+  </Card>
+  <Card title="Full DDD Support" icon="layer-group">
+    Aggregate roots, domain events, repositories, and CQRS patterns ship as first-class concepts in the framework.
+  </Card>
+</CardGroup>
+
+## Key Building Blocks
+
+MASA Framework provides the following building blocks out of the box:
+
+| Building Block | Package Prefix | Description |
+|---|---|---|
+| **EventBus** | `Masa.BuildingBlocks.Dispatcher.Events` | In-process event dispatching with middleware pipeline |
+| **Integration Events** | `Masa.BuildingBlocks.Dispatcher.IntegrationEvents` | Cross-service pub/sub via Dapr |
+| **Minimal APIs** | `Masa.BuildingBlocks.Service.MinimalAPIs` | Convention-based route auto-mapping via `ServiceBase` |
+| **Caching** | `Masa.BuildingBlocks.Caching` | Unified distributed and multilevel cache abstractions |
+| **Configuration** | `Masa.BuildingBlocks.Configuration` | Pluggable configuration providers including DCC |
+| **DDD** | `Masa.BuildingBlocks.Ddd.Domain` | Aggregates, domain events, repositories |
+| **EF Core** | `Masa.Contrib.Data.EFCore.*` | EF Core integration for multiple databases |
+| **Isolation** | `Masa.BuildingBlocks.Isolation` | Multi-tenant and multi-environment data isolation |
+| **Background Jobs** | `Masa.BuildingBlocks.Extensions.BackgroundJobs` | Scheduled and queued job abstractions |
+| **Rules Engine** | `Masa.BuildingBlocks.RulesEngine` | Pluggable business rules evaluation |
+| **Object Storage** | `Masa.BuildingBlocks.Storage.ObjectStorage` | Cloud object storage abstractions |
+| **I18n** | `Masa.BuildingBlocks.Globalization.I18n` | Internationalization and localization |
+| **CQRS** | `Masa.BuildingBlocks.ReadWriteSplitting.Cqrs` | Command/Query separation scaffolding |
+
+## NuGet Package Naming Convention
+
+MASA Framework follows a consistent naming pattern that makes it easy to find and pair packages:
+
+```
+Masa.BuildingBlocks.<Category>[.<SubCategory>]   ← abstractions (always)
+Masa.Contrib.<Category>[.<SubCategory>]          ← implementations (swap freely)
+```
+
+**Examples:**
+
+```
+Masa.BuildingBlocks.Dispatcher.Events            ← EventBus interface
+Masa.Contrib.Dispatcher.Events                   ← EventBus implementation
+
+Masa.BuildingBlocks.Caching                      ← IDistributedCacheClient interface
+Masa.Contrib.Caching.Distributed.StackExchangeRedis  ← Redis implementation
+```
+
+<Tip>
+  Always add a `Masa.BuildingBlocks.*` reference for compile-time abstractions and a matching `Masa.Contrib.*` reference for the runtime implementation. Your domain projects should reference only `Masa.BuildingBlocks.*`.
+</Tip>
+
+## License
+
+MASA Framework is released under the **MIT License**. Copyright © 2021–present MASA Stack.
+
+## Explore Further
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Build your first MASA Framework microservice with EventBus, Minimal APIs, and EF Core in five steps.
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="/architecture">
+    Deep-dive into the BuildingBlocks/Contrib layering, MasaApp global service locator, and assembly scanning.
+  </Card>
+  <Card title="Event Bus" icon="bolt" href="/building-blocks/event-bus">
+    Learn how to publish and handle in-process events with the MASA EventBus and middleware pipeline.
+  </Card>
+  <Card title="DDD Overview" icon="diagram-project" href="/ddd/overview">
+    Understand how MASA Framework models aggregates, domain events, and repositories for DDD projects.
+  </Card>
+</CardGroup>

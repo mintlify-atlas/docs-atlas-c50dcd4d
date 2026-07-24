@@ -1,0 +1,98 @@
+{
+  "projectType": "framework",
+  "projectName": "MASA Framework",
+  "projectDescription": "A .NET next-generation microservice development framework providing cloud-native building blocks based on Dapr for distributed, DDD, SaaS, and microservice applications.",
+  "theme": "palm",
+  "primaryColor": "#441cfc",
+  "lightColor": "#a48cfc",
+  "darkColor": null,
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "architecture"
+            ]
+          },
+          {
+            "group": "Building Blocks",
+            "pages": [
+              "building-blocks/event-bus",
+              "building-blocks/integration-events",
+              "building-blocks/minimal-apis",
+              "building-blocks/caller",
+              "building-blocks/caching",
+              "building-blocks/configuration"
+            ]
+          },
+          {
+            "group": "DDD & Data",
+            "pages": [
+              "ddd/overview",
+              "ddd/domain-events",
+              "ddd/ef-core",
+              "ddd/unit-of-work",
+              "ddd/cqrs"
+            ]
+          },
+          {
+            "group": "Advanced Features",
+            "pages": [
+              "advanced/isolation",
+              "advanced/globalization",
+              "advanced/background-jobs",
+              "advanced/rules-engine",
+              "advanced/object-storage"
+            ]
+          },
+          {
+            "group": "Contrib Packages",
+            "pages": [
+              "contrib/dapr-starter",
+              "contrib/distributed-lock",
+              "contrib/search-engine"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "EventBus for in-process domain event dispatching with middleware pipeline",
+    "IntegrationEvents for cross-service event publishing via Dapr pub/sub",
+    "Minimal APIs abstraction with ServiceBase for automatic route mapping",
+    "Distributed and multi-level caching with IDistributedCacheClient",
+    "DDD building blocks: AggregateRoot, Entity, ValueObject, DomainService",
+    "EFCore extensions with soft-delete, auditing, multi-tenancy, and Unit of Work",
+    "CQRS support via ReadWriteSplitting building block",
+    "Multi-tenant and multi-environment isolation",
+    "Flexible configuration system with remote config API support",
+    "Caller abstraction for HttpClient and DaprClient service invocation",
+    "Internationalization (I18n) with DCC integration",
+    "Background jobs with Hangfire and in-memory providers"
+  ],
+  "publicApiSurface": [
+    "IEventBus.PublishAsync<TEvent>",
+    "IIntegrationEventBus.PublishAsync<TEvent>",
+    "ServiceBase (MinimalAPIs base class)",
+    "IDistributedCacheClient (Get, Set, Remove, Subscribe, Publish, HashIncrement)",
+    "IMultilevelCacheClient",
+    "AggregateRoot<TKey>",
+    "Entity<TKey>",
+    "DomainService",
+    "MasaDbContext (EFCore base context)",
+    "IUnitOfWork",
+    "ICaller / CallerBase",
+    "IConfigurationApiClient / IMasaConfiguration",
+    "IIsolation (multi-tenant/multi-environment)",
+    "BackgroundJobBase",
+    "IRulesEngine",
+    "IObjectStorageClient",
+    "IAutoCompleteClient"
+  ]
+}

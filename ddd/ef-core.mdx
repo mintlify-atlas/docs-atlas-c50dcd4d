@@ -1,0 +1,235 @@
+---
+title: "EF Core Integration: MasaDbContext, Soft Delete, Auditing"
+sidebarTitle: "EF Core"
+description: "MasaDbContext extends EF Core with automatic soft-delete, auditing, multi-tenancy filters, and Unit of Work for SQL Server, MySQL, and PostgreSQL."
+---
+
+`MasaDbContext` is a drop-in replacement for EF Core's `DbContext` that wires in MASA Framework's infrastructure automatically: soft-delete filtering, creator/modifier auditing, multi-tenant isolation, Unit of Work coordination, and domain event dispatching — all triggered through the standard `SaveChangesAsync()` pipeline with zero extra code in your application layer.
+
+## Supported Databases
+
+Install the package that matches your database provider. All packages extend `MasaDbContext` with the appropriate EF Core provider configuration method.
+
+| Package | Provider |
+|---------|----------|
+| `Masa.Contrib.Data.EFCore.SqlServer` | Microsoft SQL Server |
+| `Masa.Contrib.Data.EFCore.MySql` | MySQL (official) |
+| `Masa.Contrib.Data.EFCore.Pomelo.MySql` | MySQL / MariaDB (Pomelo) |
+| `Masa.Contrib.Data.EFCore.PostgreSql` | PostgreSQL (Npgsql) |
+| `Masa.Contrib.Data.EFCore.Oracle` | Oracle |
+| `Masa.Contrib.Data.EFCore.Sqlite` | SQLite |
+| `Masa.Contrib.Data.EFCore.InMemory` | In-memory (testing) |
+| `Masa.Contrib.Data.EFCore.Cosmos` | Azure Cosmos DB |
+
+```bash
+# Example: SQL Server
+dotnet add package Masa.Contrib.Data.EFCore.SqlServer
+```
+
+---
+
+## Defining a MasaDbContext
+
+Your DbContext must inherit from `DefaultMasaDbContext` and also implement `IMasaDbContext`. Use `OnModelCreatingExecuting` instead of `OnModelCreating` — the base class seals `OnModelCreating` to apply global query filters.
+
+```csharp
+public class ShopDbContext : DefaultMasaDbContext, IMasaDbContext
+{
+    public ShopDbContext(MasaDbContextOptions<ShopDbContext> options)
+        : base(options) { }
+
+    public DbSet<Order> Orders => Set<Order>();
+    public DbSet<Product> Products => Set<Product>();
+
+    protected override void OnModelCreatingExecuting(ModelBuilder modelBuilder)
+    {
+        // Apply entity configurations
+        modelBuilder.ApplyConfigurationsFromAssembly(typeof(ShopDbContext).Assembly);
+    }
+}
+```
+
+<Warning>
+  Override `OnModelCreatingExecuting` rather than `OnModelCreating`. The base `DefaultMasaDbContext` seals `OnModelCreating` to guarantee that global soft-delete, multi-tenant, and environment filters are applied correctly.
+</Warning>
+
+---
+
+## Registering with the DI Container
+
+```csharp
+// Program.cs
+builder.Services.AddMasaDbContext<ShopDbContext>(dbContextBuilder =>
+    dbContextBuilder.UseSqlServer(
+        builder.Configuration.GetConnectionString("DefaultConnection")));
+```
+
+To include Unit of Work and domain event dispatch in the same registration:
+
+```csharp
+builder.Services
+    .AddEventBus()
+    .AddMasaDbContext<ShopDbContext>(opts =>
+        opts.UseSqlServer(connStr)
+            .UseUoW());                 // registers IUnitOfWork backed by ShopDbContext
+```
+
+---
+
+## Automatic Soft Delete
+
+Entities that implement `ISoftDelete` are **never physically deleted** from the database. Instead, the `SoftDeleteSaveChangesFilter` intercepts `EntityState.Deleted` entries during `SaveChanges` and flips `IsDeleted = true`. Global query filters on `MasaDbContext` then exclude soft-deleted rows from all subsequent queries.
+
+```csharp
+// ISoftDelete adds a single bool IsDeleted property
+public class Order : FullAggregateRoot<Guid, Guid>
+{
+    // IsDeleted is inherited from FullAggregateRoot — no extra code needed
+    public string CustomerName { get; set; } = string.Empty;
+}
+
+// Soft delete a record — sets IsDeleted = true, no DELETE statement
+await orderRepository.RemoveAsync(order);
+await unitOfWork.SaveChangesAsync();
+
+// Subsequent queries automatically exclude IsDeleted = true records
+var activeOrders = await orderRepository.GetListAsync(); // soft-deleted orders are invisible
+```
+
+<Tip>
+  Soft delete cascades to owned navigation properties. If a parent aggregate is soft-deleted, the `SoftDeleteSaveChangesFilter` walks all loaded child `ISoftDelete` navigation entries and soft-deletes them as well.
+</Tip>
+
+---
+
+## Automatic Auditing
+
+Entities that implement `IAuditEntity<TUserId>` have their `Creator`, `CreationTime`, `Modifier`, and `ModificationTime` fields populated automatically. The `SoftDeleteSaveChangesFilter` also updates `Modifier` and `ModificationTime` when a soft-delete occurs.
+
+```csharp
+// FullAggregateRoot<TKey, TUserId> implements ISoftDelete + IAuditAggregateRoot
+public class Product : FullAggregateRoot<Guid, Guid>
+{
+    public string Name { get; set; } = string.Empty;
+    public decimal Price { get; set; }
+
+    // Inherited:
+    //   Id              (Guid)
+    //   Creator         (Guid) — set on Add
+    //   CreationTime    (DateTime UTC) — set on Add
+    //   Modifier        (Guid) — updated on Update / soft-delete
+    //   ModificationTime (DateTime UTC) — updated on Update / soft-delete
+    //   IsDeleted       (bool) — flipped on soft-delete
+
+    public Product(Guid id, string name, decimal price) : base(id)
+    {
+        Name = name;
+        Price = price;
+    }
+}
+```
+
+The current user identity is resolved from `IUserContext` (part of `Masa.Contrib.Identity`) if registered.
+
+---
+
+## Multi-Tenancy and Multi-Environment Filters
+
+`DefaultMasaDbContext` automatically applies EF Core global query filters based on active data-filter states:
+
+| Interface | Filter behavior |
+|-----------|----------------|
+| `ISoftDelete` | Excludes `IsDeleted = true` rows |
+| `IMultiTenant<TId>` | Scopes rows to `TenantContext.CurrentTenant.Id` |
+| `IMultiEnvironment` | Scopes rows to `EnvironmentContext.CurrentEnvironment` |
+
+Filters are only active when the corresponding `IDataFilter` is enabled. You can temporarily disable a filter inside a scope:
+
+```csharp
+// Access soft-deleted records in an admin context
+using (dataFilter.Disable<ISoftDelete>())
+{
+    var allOrders = await dbContext.Orders.ToListAsync();
+}
+```
+
+---
+
+## ISaveChangesFilter Pipeline
+
+Before EF Core writes to the database, `DefaultMasaDbContext` calls every registered `ISaveChangesFilter` via `OnBeforeSaveChangesByFilters()`. MASA Framework ships `SoftDeleteSaveChangesFilter` out of the box, and you can add your own:
+
+```csharp
+public class TimestampSaveChangesFilter<TDbContext> : ISaveChangesFilter<TDbContext>
+    where TDbContext : DbContext, IMasaDbContext
+{
+    public void OnExecuting(ChangeTracker changeTracker)
+    {
+        foreach (var entry in changeTracker.Entries<IHasTimestamp>()
+                     .Where(e => e.State == EntityState.Added || e.State == EntityState.Modified))
+        {
+            entry.Entity.LastUpdated = DateTime.UtcNow;
+        }
+    }
+}
+```
+
+Register it during `AddMasaDbContext` configuration.
+
+---
+
+## Complete Example
+
+### Entity definition
+
+```csharp
+// Full aggregate: soft-delete + auditing, primary key = Guid, user key = Guid
+public class Order : FullAggregateRoot<Guid, Guid>
+{
+    public string CustomerName { get; private set; } = string.Empty;
+    public string Status { get; private set; } = "Pending";
+
+    private readonly List<OrderItem> _items = new();
+    public IReadOnlyList<OrderItem> Items => _items.AsReadOnly();
+
+    public Order(Guid id, string customerName) : base(id)
+    {
+        CustomerName = customerName;
+    }
+
+    public void AddItem(OrderItem item)
+    {
+        _items.Add(item);
+        AddDomainEvent(new OrderItemAddedEvent(Id, item));
+    }
+}
+```
+
+### DbContext
+
+```csharp
+public class ShopDbContext : DefaultMasaDbContext, IMasaDbContext
+{
+    public ShopDbContext(MasaDbContextOptions<ShopDbContext> options) : base(options) { }
+
+    public DbSet<Order> Orders => Set<Order>();
+    public DbSet<Product> Products => Set<Product>();
+}
+```
+
+### Registration
+
+```csharp
+builder.Services.AddMasaDbContext<ShopDbContext>(dbContextBuilder =>
+    dbContextBuilder.UseSqlServer(
+        builder.Configuration.GetConnectionString("DefaultConnection")));
+```
+
+### Query (soft-deleted rows excluded automatically)
+
+```csharp
+// Only returns orders where IsDeleted = false — no Where clause needed
+var pendingOrders = await dbContext.Orders
+    .Where(o => o.Status == "Pending")
+    .ToListAsync();
+```

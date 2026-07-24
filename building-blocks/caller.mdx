@@ -1,0 +1,246 @@
+---
+title: "Caller: Typed HTTP and Dapr Service Invocation"
+sidebarTitle: "Caller"
+description: "MASA Framework Caller provides a typed abstraction for invoking microservices via HttpClient or Dapr service invocation with built-in authentication and serialization."
+---
+
+Caller is MASA Framework's typed HTTP client abstraction. It wraps `HttpClient` or Dapr's service-invocation API behind a consistent `ICaller` interface, giving your application services a single, testable way to call downstream microservices — with automatic JSON serialisation, configurable error handling, Bearer token forwarding, and support for named multi-client registrations.
+
+## Installation
+
+Choose the transport that matches your infrastructure:
+
+```bash
+# Plain HttpClient transport
+dotnet add package Masa.Contrib.Service.Caller.HttpClient
+
+# Dapr service invocation transport
+dotnet add package Masa.Contrib.Service.Caller.DaprClient
+
+# Optional: automatic Bearer token forwarding for ASP.NET Core
+dotnet add package Masa.Contrib.Service.Caller.Authentication.AspNetCore
+```
+
+## The `ICaller` Interface
+
+`ICaller` is the central abstraction. Once injected, all downstream calls go through it regardless of the underlying transport.
+
+### Standard HTTP Methods
+
+```csharp
+// GET
+Task<TResponse?> GetAsync<TResponse>(string methodName,
+    CancellationToken cancellationToken = default);
+
+Task<TResponse?> GetAsync<TRequest, TResponse>(string methodName, TRequest data,
+    CancellationToken cancellationToken = default);
+
+// POST
+Task<TResponse?> PostAsync<TRequest, TResponse>(string methodName, TRequest data,
+    CancellationToken cancellationToken = default);
+
+Task PostAsync<TRequest>(string methodName, TRequest data,
+    CancellationToken cancellationToken = default);
+
+// PUT
+Task<TResponse?> PutAsync<TRequest, TResponse>(string methodName, TRequest data,
+    CancellationToken cancellationToken = default);
+
+// DELETE
+Task<TResponse?> DeleteAsync<TRequest, TResponse>(string methodName, TRequest data,
+    CancellationToken cancellationToken = default);
+
+// PATCH
+Task<TResponse?> PatchAsync<TRequest, TResponse>(string methodName, TRequest data,
+    CancellationToken cancellationToken = default);
+```
+
+### Raw and gRPC Variants
+
+```csharp
+// Send a pre-built HttpRequestMessage
+Task<TResponse?> SendAsync<TResponse>(HttpRequestMessage request,
+    CancellationToken cancellationToken = default);
+
+// Send with explicit method, path, and body
+Task<TResponse?> SendAsync<TResponse>(HttpMethod method, string methodName,
+    HttpContent? content, bool autoThrowException = true,
+    CancellationToken cancellationToken = default);
+
+// gRPC (Dapr transport)
+Task<TResponse?> SendGrpcAsync<TRequest, TResponse>(string methodName,
+    TRequest request, CancellationToken cancellationToken = default);
+
+// Response as primitive types
+Task<string?> GetStringAsync(string methodName, ...);
+Task<byte[]?> GetByteArrayAsync(string methodName, ...);
+Task<Stream?> GetStreamAsync(string methodName, ...);
+```
+
+The `autoThrowException` parameter (defaults to `true`) causes `ICaller` to throw a `UserFriendlyException` or `MasaException` when the HTTP response status indicates failure. Set it to `false` to inspect the raw response yourself.
+
+## Defining a Typed Caller
+
+Extend `CallerBase` and override `UseCallerExtension()` to bind your service-specific base address and transport. Methods on the class delegate to the protected `Caller` property:
+
+### HttpClient Caller
+
+```csharp
+public class OrderCaller : CallerBase
+{
+    public override void UseCallerExtension()
+        => CallerBuilder.UseHttpClient(client =>
+        {
+            client.BaseAddress = new Uri("http://order-service");
+            client.Timeout = TimeSpan.FromSeconds(30);
+        });
+
+    public Task<List<Order>?> GetOrdersAsync()
+        => Caller.GetAsync<List<Order>>("/api/v1/orders");
+
+    public Task<Order?> GetOrderAsync(Guid id)
+        => Caller.GetAsync<Order>($"/api/v1/orders/{id}");
+
+    public Task<Order?> CreateOrderAsync(CreateOrderRequest request)
+        => Caller.PostAsync<CreateOrderRequest, Order>("/api/v1/orders", request);
+
+    public Task UpdateOrderAsync(Guid id, UpdateOrderRequest request)
+        => Caller.PutAsync<UpdateOrderRequest>($"/api/v1/orders/{id}", request);
+
+    public Task DeleteOrderAsync(Guid id)
+        => Caller.DeleteAsync($"/api/v1/orders/{id}");
+}
+```
+
+### Dapr Caller
+
+When using Dapr, replace `UseHttpClient` with `UseDaprClient`. The app ID replaces the base address — Dapr's sidecar handles service discovery and mTLS:
+
+```csharp
+public class InventoryCaller : CallerBase
+{
+    public override void UseCallerExtension()
+        => CallerBuilder.UseDaprClient("inventory-service");
+
+    public Task<int?> GetStockAsync(string productId)
+        => Caller.GetAsync<int>($"/api/v1/inventory/{productId}");
+
+    public Task ReserveStockAsync(ReserveStockRequest request)
+        => Caller.PostAsync("/api/v1/inventory/reserve", request);
+
+    public Task<int?> GetStockGrpcAsync(string productId)
+        => Caller.SendGrpcAsync<string, int>("GetStock", productId);
+}
+```
+
+## Registration
+
+Register callers in `Program.cs`. The framework automatically discovers `CallerBase` subclasses or you can register them explicitly:
+
+```csharp
+// Auto-discover all CallerBase subclasses in the assembly
+builder.Services.AddCaller(Assembly.GetEntryAssembly()!);
+
+// Or register explicitly
+builder.Services.AddCaller(callerBuilder =>
+{
+    callerBuilder.AddCaller<OrderCaller>();
+    callerBuilder.AddCaller<InventoryCaller>();
+});
+```
+
+## Named Callers via `ICallerFactory`
+
+When you have multiple downstream services, use `ICallerFactory` to resolve a specific caller by name at runtime:
+
+```csharp
+// Registration with a name
+builder.Services.AddCaller("order", callerBuilder =>
+    callerBuilder.UseHttpClient(client =>
+        client.BaseAddress = new Uri("http://order-service")));
+
+builder.Services.AddCaller("inventory", callerBuilder =>
+    callerBuilder.UseHttpClient(client =>
+        client.BaseAddress = new Uri("http://inventory-service")));
+
+// Resolution at runtime
+public class CheckoutService : ServiceBase
+{
+    private readonly ICallerFactory _callerFactory;
+
+    public CheckoutService(ICallerFactory callerFactory)
+        => _callerFactory = callerFactory;
+
+    public async Task CheckoutAsync(Guid cartId)
+    {
+        var orderCaller = _callerFactory.Create("order");
+        var inventoryCaller = _callerFactory.Create("inventory");
+
+        var stock = await inventoryCaller.GetAsync<int>($"/api/v1/inventory/{cartId}");
+        var order = await orderCaller.PostAsync<CheckoutRequest, Order>(
+            "/api/v1/orders",
+            new CheckoutRequest { CartId = cartId });
+    }
+}
+```
+
+## Injecting a Typed Caller
+
+Typed callers (subclasses of `CallerBase`) are registered in DI and can be injected directly:
+
+```csharp
+public class CartService : ServiceBase
+{
+    private readonly OrderCaller _orderCaller;
+    private readonly InventoryCaller _inventoryCaller;
+
+    public CartService(OrderCaller orderCaller, InventoryCaller inventoryCaller)
+    {
+        _orderCaller = orderCaller;
+        _inventoryCaller = inventoryCaller;
+    }
+
+    public async Task CheckoutAsync(Guid cartId)
+    {
+        var stock = await _inventoryCaller.GetStockAsync(cartId.ToString());
+        if (stock <= 0)
+            throw new InvalidOperationException("Out of stock");
+
+        var order = await _orderCaller.CreateOrderAsync(
+            new CreateOrderRequest { CartId = cartId });
+    }
+}
+```
+
+## Bearer Token Forwarding
+
+Install `Masa.Contrib.Service.Caller.Authentication.AspNetCore` to automatically forward the current request's Bearer token to downstream services. Register it alongside your caller:
+
+```csharp
+builder.Services.AddCaller(callerBuilder =>
+{
+    callerBuilder.AddCaller<OrderCaller>();
+    callerBuilder.UseAuthentication(); // forwards Authorization header automatically
+});
+```
+
+When the current HTTP context carries an `Authorization: Bearer <token>` header, every outgoing `ICaller` request will include the same header — no manual token propagation required.
+
+## Request and Response Customisation
+
+Override `RequestMessageFactory` or `ResponseMessageFactory` on your `CallerBase` subclass to intercept and modify requests or responses globally for that caller:
+
+```csharp
+public class SignedOrderCaller : CallerBase
+{
+    public override void UseCallerExtension()
+        => CallerBuilder.UseHttpClient(client =>
+            client.BaseAddress = new Uri("http://order-service"));
+
+    protected override void ConfigureRequest(HttpRequestMessage request)
+    {
+        request.Headers.Add("X-Api-Key", "secret-key");
+        request.Headers.Add("X-Request-Id", Guid.NewGuid().ToString());
+    }
+}
+```

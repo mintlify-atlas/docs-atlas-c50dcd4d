@@ -1,0 +1,261 @@
+---
+title: "Configuration Management with MasaConfiguration"
+sidebarTitle: "Configuration"
+description: "MASA Framework MasaConfiguration manages local and remote configuration with hot-reload, IOptions integration, and ConfigurationApi support for centralized config."
+---
+
+MasaConfiguration unifies local and remote configuration under a single `IMasaConfiguration` interface. It keeps the familiar `IOptions<T>` / `IConfiguration` patterns your team already knows, adds hot-reload for remote sources, and optionally integrates with **DCC** (Distributed Configuration Center) — MASA's centralised configuration service — so all microservices can share and instantly react to config changes without redeployment.
+
+## Installation
+
+```bash
+# Core MasaConfiguration
+dotnet add package Masa.Contrib.Configuration
+
+# DCC remote configuration provider (optional)
+dotnet add package Masa.Contrib.Configuration.ConfigurationApi.Dcc
+```
+
+## Core Abstractions
+
+### `IMasaConfiguration`
+
+`IMasaConfiguration` is the root interface. It exposes two configuration sources:
+
+| Property | Type | Description |
+|---|---|---|
+| `.Local` | `IConfiguration` | Standard `IConfiguration` backed by `appsettings.json`, env vars, etc. |
+| `.ConfigurationApi` | `IConfiguration` | Remote configuration pulled from DCC or another `IConfigurationApiClient` |
+
+### `MasaAppConfigureOptions`
+
+Contains the application identity used when fetching remote config:
+
+| Property | Description |
+|---|---|
+| `AppId` | Application identifier (maps to DCC app) |
+| `Environment` | Deployment environment (`Development`, `Staging`, `Production`) |
+| `Cluster` | Logical cluster within the environment |
+
+These values are resolved in order from: explicit code registration → `appsettings.json` (`MasaAppConfigureOptions` section) → environment variables.
+
+## Registering MasaConfiguration
+
+### Local Only
+
+```csharp
+builder.Services.AddMasaConfiguration();
+```
+
+This enriches the existing `IConfiguration` with MASA's strongly-typed binding helpers while keeping all local providers.
+
+### With DCC Remote Configuration
+
+```csharp
+builder.Services.AddMasaConfiguration(configurationBuilder =>
+    configurationBuilder.UseDcc());
+```
+
+Add a `MasaAppConfigureOptions` section to `appsettings.json` so the DCC client knows which app to load:
+
+```json
+{
+  "MasaAppConfigureOptions": {
+    "AppId": "order-service",
+    "Environment": "Production",
+    "Cluster": "default"
+  },
+  "DCC": {
+    "ManageServiceAddress": "http://dcc-server:8080",
+    "RedisOptions": {
+      "Servers": [{ "Host": "localhost", "Port": 6379 }]
+    }
+  }
+}
+```
+
+### Initialise Application Configuration
+
+Call `InitializeAppConfiguration()` before `AddMasaConfiguration` when you need `MasaAppConfigureOptions` available at startup (e.g., for conditional provider registration):
+
+```csharp
+builder.Services.InitializeAppConfiguration();
+builder.Services.AddMasaConfiguration(configurationBuilder =>
+    configurationBuilder.UseDcc());
+```
+
+## Binding Options to Configuration Sections
+
+`AddConfigure<TOptions>` binds a configuration section to an options class and registers it with `IOptions<T>`, `IOptionsSnapshot<T>`, and `IOptionsMonitor<T>`:
+
+```csharp
+// Bind "Redis" section → RedisOptions
+builder.Services.AddConfigure<RedisOptions>("Redis");
+
+// Bind a nested section
+builder.Services.AddConfigure<JwtOptions>("Authentication:Jwt");
+
+// Bind from the remote ConfigurationApi source
+builder.Services.AddConfigure<FeatureFlags>("FeatureFlags",
+    ConfigurationTypes.ConfigurationApi);
+```
+
+`ConfigurationTypes` enum:
+
+| Value | Source |
+|---|---|
+| `Local` (default) | `appsettings.json`, env vars, etc. |
+| `ConfigurationApi` | DCC or remote `IConfigurationApiClient` |
+
+## Consuming Configuration in Services
+
+### Via `IOptions<T>`
+
+```csharp
+public record RedisOptions
+{
+    public string Host { get; init; } = "localhost";
+    public int Port { get; init; } = 6379;
+    public int DefaultDatabase { get; init; } = 0;
+}
+
+public class CacheService
+{
+    private readonly RedisOptions _options;
+
+    public CacheService(IOptions<RedisOptions> options)
+        => _options = options.Value;
+
+    public string GetConnectionString()
+        => $"{_options.Host}:{_options.Port},defaultDatabase={_options.DefaultDatabase}";
+}
+```
+
+### Via `IOptionsMonitor<T>` (Hot-Reload)
+
+Use `IOptionsMonitor<T>` when the underlying value may change at runtime. DCC pushes updates via Redis, so `CurrentValue` reflects the latest version without a restart:
+
+```csharp
+public class FeatureFlagService
+{
+    private readonly IOptionsMonitor<FeatureFlags> _monitor;
+
+    public FeatureFlagService(IOptionsMonitor<FeatureFlags> monitor)
+        => _monitor = monitor;
+
+    public bool IsNewCheckoutEnabled()
+        => _monitor.CurrentValue.NewCheckout;
+}
+```
+
+Register a change callback if you need to react immediately to a remote update:
+
+```csharp
+public class FeatureFlagService : IDisposable
+{
+    private readonly IOptionsMonitor<FeatureFlags> _monitor;
+    private readonly IDisposable? _listener;
+
+    public FeatureFlagService(IOptionsMonitor<FeatureFlags> monitor)
+    {
+        _monitor = monitor;
+        _listener = monitor.OnChange(flags =>
+            Console.WriteLine($"FeatureFlags updated: NewCheckout={flags.NewCheckout}"));
+    }
+
+    public void Dispose() => _listener?.Dispose();
+}
+```
+
+## Reading Remote Configuration via `IConfigurationApiClient`
+
+For scenarios where you need raw key/value access rather than strongly-typed options, inject `IConfigurationApiClient` directly:
+
+```csharp
+public class ConfigDemoService
+{
+    private readonly IConfigurationApiClient _configClient;
+
+    public ConfigDemoService(IConfigurationApiClient configClient)
+        => _configClient = configClient;
+
+    public async Task<string?> GetRawValueAsync(string configObjectName, string key)
+    {
+        // Resolves using the registered AppId / Environment / Cluster
+        var (raw, _) = await _configClient.GetRawAsync(configObjectName, key);
+        return raw;
+    }
+
+    public async Task<T?> GetAsync<T>(string configObjectName)
+        => await _configClient.GetAsync<T>(configObjectName);
+}
+```
+
+## Managing Remote Configuration via `IConfigurationApiManage`
+
+`IConfigurationApiManage` allows your application to publish configuration updates back to DCC programmatically — useful for admin tooling or automated config migrations:
+
+```csharp
+public class ConfigAdminService
+{
+    private readonly IConfigurationApiManage _configManage;
+
+    public ConfigAdminService(IConfigurationApiManage configManage)
+        => _configManage = configManage;
+
+    public async Task UpdateFeatureFlagAsync(string appId, bool newCheckout)
+    {
+        await _configManage.UpdateAsync(appId, "default", "Production",
+            "FeatureFlags",
+            new Dictionary<string, string> { ["NewCheckout"] = newCheckout.ToString() });
+    }
+}
+```
+
+## Example `appsettings.json`
+
+```json
+{
+  "MasaAppConfigureOptions": {
+    "AppId": "order-service",
+    "Environment": "Production",
+    "Cluster": "default"
+  },
+  "Redis": {
+    "Host": "redis-master",
+    "Port": 6379,
+    "DefaultDatabase": 2
+  },
+  "Authentication": {
+    "Jwt": {
+      "Issuer": "https://auth.example.com",
+      "Audience": "order-service",
+      "SecretKey": "your-256-bit-secret"
+    }
+  }
+}
+```
+
+## Complete `Program.cs` Setup
+
+```csharp
+var builder = WebApplication.CreateBuilder(args);
+
+// Initialise app identity (AppId, Environment, Cluster)
+builder.Services.InitializeAppConfiguration();
+
+// Register MasaConfiguration with DCC remote config
+builder.Services.AddMasaConfiguration(configurationBuilder =>
+    configurationBuilder.UseDcc());
+
+// Bind local sections to options classes
+builder.Services.AddConfigure<RedisOptions>("Redis");
+builder.Services.AddConfigure<JwtOptions>("Authentication:Jwt");
+
+// Bind a remote section from DCC
+builder.Services.AddConfigure<FeatureFlags>(
+    "FeatureFlags", ConfigurationTypes.ConfigurationApi);
+
+var app = builder.Build();
+app.Run();
+```

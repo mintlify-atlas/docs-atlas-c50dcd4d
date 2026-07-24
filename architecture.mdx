@@ -1,0 +1,192 @@
+---
+title: "MASA Framework Architecture and Building Blocks"
+sidebarTitle: "Architecture"
+description: "Understand the two-layer BuildingBlocks and Contrib package structure, assembly scanning, MasaApp global service locator, and how building blocks compose in MASA Framework."
+---
+
+MASA Framework is designed around a strict two-layer package architecture that separates technology-agnostic abstractions from concrete implementations. This design lets you build your domain and application layers against stable interfaces while swapping the underlying infrastructure providers freely — often with a single line change in `Program.cs`.
+
+## The Two-Layer Design
+
+Every capability is split across two NuGet package families:
+
+```
+Masa.BuildingBlocks.<Category>   ← interfaces, base classes, contracts
+Masa.Contrib.<Category>          ← concrete implementations, DI registrations
+```
+
+**BuildingBlocks packages** contain only pure C# abstractions: interfaces (e.g. `IEventBus`, `IDistributedCacheClient`), base classes (e.g. `ServiceBase`, `Event`), and data contracts. They carry zero framework-specific dependencies and are safe to reference from domain libraries.
+
+**Contrib packages** contain the real implementations backed by specific technologies (Redis, SQL Server, Dapr, etc.). Each Contrib package includes its own `ServiceCollectionExtensions` with `Add*` methods that register the implementation under the corresponding BuildingBlocks interface.
+
+<Note>
+  Your domain and application projects should reference only `Masa.BuildingBlocks.*`. Only your composition root (typically `Program.cs` or the host project) needs to reference `Masa.Contrib.*` packages.
+</Note>
+
+### Swapping Implementations
+
+Because all service code depends on `Masa.BuildingBlocks` abstractions, switching a provider means:
+
+1. Remove the old `Masa.Contrib.*` NuGet package.
+2. Add the new `Masa.Contrib.*` NuGet package.
+3. Change the `Add*` call in `Program.cs`.
+
+No domain or application code changes are required.
+
+```csharp
+// Switch from SQL Server to PostgreSQL:
+// Before:
+// builder.Services.UseSqlServer<OrderDbContext>(connectionString);
+// After:
+builder.Services.UseNpgsql<OrderDbContext>(connectionString);
+```
+
+## MasaApp — The Global Service Locator
+
+`MasaApp` (in `Masa.BuildingBlocks.Data`) is the static global service locator used internally throughout the framework. It bridges the gap between the static extension-method entry points and the DI container.
+
+Key members:
+
+| Member | Description |
+|---|---|
+| `MasaApp.GetAssemblies()` | Returns the global assembly list used for scanning. Falls back to `AppDomain.CurrentDomain.GetAssemblies()` if not explicitly set. |
+| `MasaApp.SetAssemblies(params Assembly[])` | Override the assembly list (useful in unit tests or modular monoliths). |
+| `MasaApp.TrySetAssemblies(...)` | Set only if not already assigned. |
+| `MasaApp.GetRequiredService<T>()` | Resolve a service from the root `IServiceProvider`. |
+| `MasaApp.GetService<T>()` | Nullable variant of `GetRequiredService<T>()`. |
+| `MasaApp.Build(IServiceProvider)` | Captures the built `IServiceProvider` as the root provider. |
+| `MasaApp.GetServices()` | Returns the global `IServiceCollection` reference. |
+
+```csharp
+// Explicitly scope assembly scanning to your own assemblies
+MasaApp.SetAssemblies(
+    typeof(Program).Assembly,
+    typeof(OrderService).Assembly
+);
+```
+
+<Warning>
+  `MasaApp.GetRequiredService<T>()` resolves from the **root** provider, not the current HTTP request scope. Avoid using it to resolve scoped services; prefer injecting them through constructor or Minimal API parameter binding.
+</Warning>
+
+## Assembly Scanning
+
+MASA Framework building blocks discover handlers, services, and other convention-based types through automatic assembly scanning at startup. All scanning goes through `MasaApp.GetAssemblies()`, so the framework always operates on a consistent, configurable assembly list.
+
+<Accordion title="EventBus scanning (AddEventBus)">
+  `services.AddEventBus()` calls `MasaApp.GetAssemblies()` to obtain all assemblies, then uses `DefaultDispatchNetworkProvider` to reflect over every public type and method. Methods decorated with `[EventHandler]` are compiled into a dispatch network (a directed graph from event type to ordered handler list). The handler types are then registered in DI at `ServiceLifetime.Scoped`.
+
+  ```csharp
+  // Default: scans MasaApp.GetAssemblies()
+  services.AddEventBus();
+
+  // Explicit assembly list:
+  services.AddEventBus(new[] { typeof(OrderCommandHandler).Assembly });
+  ```
+</Accordion>
+
+<Accordion title="MinimalAPIs scanning (AddServices / MapMasaMinimalAPIs)">
+  `builder.AddServices()` scans `MasaApp.GetAssemblies()` for all concrete types that inherit `ServiceBase`. Each discovered type is registered as a singleton in DI, and its `Type` is appended to `GlobalMinimalApiOptions.ServiceTypes`. Later, `app.MapMasaMinimalAPIs()` iterates that list, resolves each `ServiceBase` instance, and calls `AutoMapRoute()` to register endpoints with the ASP.NET Core router.
+</Accordion>
+
+## Building Blocks Reference
+
+The following table lists every building block shipped in `Masa.BuildingBlocks`:
+
+| Category | Package | Key Abstraction |
+|---|---|---|
+| Caching | `Masa.BuildingBlocks.Caching` | `IDistributedCacheClient`, `IMultilevelCacheClient` |
+| Configuration | `Masa.BuildingBlocks.Configuration` | `IConfigurationApiClient` |
+| DDD — Domain | `Masa.BuildingBlocks.Ddd.Domain` | `IAggregateRoot`, `IDomainEventBus`, `IRepository<>` |
+| EventBus | `Masa.BuildingBlocks.Dispatcher.Events` | `IEventBus`, `IEvent`, `IEventHandler<>` |
+| Integration Events | `Masa.BuildingBlocks.Dispatcher.IntegrationEvents` | `IIntegrationEventBus`, `IIntegrationEvent` |
+| Minimal APIs | `Masa.BuildingBlocks.Service.MinimalAPIs` | `ServiceBase`, `IService` |
+| Caller | `Masa.BuildingBlocks.Service.Caller` | `ICaller`, `ICallerFactory` |
+| Isolation | `Masa.BuildingBlocks.Isolation` | `IMultiTenantContext`, `IMultiEnvironmentContext` |
+| CQRS | `Masa.BuildingBlocks.ReadWriteSplitting.Cqrs` | `ICommand`, `IQuery<>`, `IQueryHandler<,>` |
+| Event Sourcing | `Masa.BuildingBlocks.ReadWriteSplitting.EventSourcing` | `IEventSourceRepository<>` |
+| Object Storage | `Masa.BuildingBlocks.Storage.ObjectStorage` | `IClient` (object storage) |
+| Background Jobs | `Masa.BuildingBlocks.Extensions.BackgroundJobs` | `IBackgroundJobManager` |
+| Rules Engine | `Masa.BuildingBlocks.RulesEngine` | `IRulesEngineClient` |
+| Search / AutoComplete | `Masa.BuildingBlocks.SearchEngine.AutoComplete` | `IAutoCompleteClient` |
+| Globalization / I18n | `Masa.BuildingBlocks.Globalization.I18n` | `II18n`, `I18n<>` |
+
+## Contrib Implementations Reference
+
+Each `Masa.Contrib.*` package registers its implementation under the matching `Masa.BuildingBlocks` interface. The table below maps building blocks to their available Contrib providers:
+
+| Building Block | Contrib Package | Technology |
+|---|---|---|
+| Distributed Cache | `Masa.Contrib.Caching.Distributed.StackExchangeRedis` | Redis via StackExchange.Redis |
+| Multilevel Cache | `Masa.Contrib.Caching.MultilevelCache` | In-process + distributed hybrid |
+| Configuration | `Masa.Contrib.Configuration` | Microsoft.Extensions.Configuration |
+| Configuration (DCC) | `Masa.Contrib.Configuration.ConfigurationApi.Dcc` | MASA DCC remote config |
+| EF Core (SQL Server) | `Masa.Contrib.Data.EFCore.SqlServer` | SQL Server |
+| EF Core (PostgreSQL) | `Masa.Contrib.Data.EFCore.PostgreSql` | PostgreSQL |
+| EF Core (MySQL) | `Masa.Contrib.Data.EFCore.MySql` / `Masa.Contrib.Data.EFCore.Pomelo.MySql` | MySQL / MariaDB |
+| EF Core (SQLite) | `Masa.Contrib.Data.EFCore.Sqlite` | SQLite |
+| EF Core (Oracle) | `Masa.Contrib.Data.EFCore.Oracle` | Oracle |
+| EF Core (Cosmos) | `Masa.Contrib.Data.EFCore.Cosmos` | Azure Cosmos DB |
+| EF Core (In-Memory) | `Masa.Contrib.Data.EFCore.InMemory` | In-memory (testing) |
+| DDD Domain | `Masa.Contrib.Ddd.Domain` | Core domain services |
+| DDD Repository | `Masa.Contrib.Ddd.Domain.Repository.EFCore` | EF Core repository impl |
+| EventBus | `Masa.Contrib.Dispatcher.Events` | In-process local dispatcher |
+| Integration Events | `Masa.Contrib.Dispatcher.IntegrationEvents` | Transactional outbox base |
+| Integration Events (Dapr) | `Masa.Contrib.Dispatcher.IntegrationEvents.Dapr` | Dapr pub/sub |
+| Integration Event Logs | `Masa.Contrib.Dispatcher.IntegrationEvents.EventLogs.EFCore` | EF Core outbox log |
+| Minimal APIs | `Masa.Contrib.Service.MinimalAPIs` | ASP.NET Core Minimal APIs |
+| Caller (HTTP) | `Masa.Contrib.Service.Caller.HttpClient` | `HttpClient`-based |
+| Caller (Dapr) | `Masa.Contrib.Service.Caller.DaprClient` | Dapr service invocation |
+| Isolation | `Masa.Contrib.Isolation` | Core isolation middleware |
+| Isolation (Multi-Tenant) | `Masa.Contrib.Isolation.MultiTenant` | Tenant resolution |
+| Isolation (Multi-Env) | `Masa.Contrib.Isolation.MultiEnvironment` | Environment resolution |
+| CQRS | `Masa.Contrib.ReadWriteSplitting.Cqrs` | CQRS scaffolding |
+| Object Storage | `Masa.Contrib.Storage.ObjectStorage` | Base object storage |
+| Background Jobs (Memory) | `Masa.Contrib.Extensions.BackgroundJobs.Memory` | In-memory (dev/testing) |
+| Background Jobs (Hangfire) | `Masa.Contrib.Extensions.BackgroundJobs.Hangfire` | Hangfire |
+| Rules Engine | `Masa.Contrib.RulesEngine.MicrosoftRulesEngine` | Microsoft RulesEngine |
+| I18n | `Masa.Contrib.Globalization.I18n` | JSON resource files |
+| I18n (ASP.NET Core) | `Masa.Contrib.Globalization.I18n.AspNetCore` | Request culture middleware |
+| I18n (DCC) | `Masa.Contrib.Globalization.I18n.Dcc` | MASA DCC remote i18n |
+
+## How Building Blocks Compose
+
+The diagram below shows the dependency flow for a typical microservice:
+
+```
+┌──────────────────────────────────────────────┐
+│              Your Application Code           │
+│  (depends on Masa.BuildingBlocks.* only)     │
+└────────────────────┬─────────────────────────┘
+                     │ references interfaces
+                     ▼
+┌──────────────────────────────────────────────┐
+│           Masa.BuildingBlocks.*              │
+│  IEventBus, ServiceBase, IRepository<>, …   │
+└────────────────────▲─────────────────────────┘
+                     │ implements
+┌──────────────────────────────────────────────┐
+│              Masa.Contrib.*                  │
+│  EventBus, MinimalAPIs, EFCore.SqlServer, …  │
+│  (registered in Program.cs / host)           │
+└──────────────────────────────────────────────┘
+```
+
+The composition root (`Program.cs`) is the **only** place that knows which Contrib packages are used. Every other project in the solution stays fully decoupled from infrastructure choices.
+
+## Explore Building Blocks
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    See a working Program.cs, ServiceBase, and EventHandler wired together end-to-end.
+  </Card>
+  <Card title="Introduction" icon="book-open" href="/introduction">
+    Overview of MASA Framework's goals, package conventions, and MIT license.
+  </Card>
+  <Card title="Event Bus" icon="bolt" href="/building-blocks/event-bus">
+    Publish and handle in-process events with middleware, retry, and saga support.
+  </Card>
+  <Card title="DDD Overview" icon="diagram-project" href="/ddd/overview">
+    Aggregates, domain events, and EF Core repositories for DDD architectures.
+  </Card>
+</CardGroup>

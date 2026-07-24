@@ -1,0 +1,245 @@
+---
+title: "CQRS Pattern with Commands and Queries in MASA Framework"
+sidebarTitle: "CQRS"
+description: "MASA Framework CQRS uses Command and Query<TResult> records via IEventBus, with ICommandHandler and IQueryHandler for clean read/write separation."
+---
+
+CQRS (Command Query Responsibility Segregation) splits the read and write paths of your application into distinct models. In MASA Framework, commands represent intentions to change state while queries retrieve data — both are dispatched through the same `IEventBus.PublishAsync()` API, but resolved to their respective handlers at runtime. This gives you a clean, testable, and scalable architecture without introducing separate infrastructure for each operation type.
+
+## Installation
+
+```bash
+# Abstractions (Command, Query, ICommandHandler, IQueryHandler)
+dotnet add package Masa.BuildingBlocks.ReadWriteSplitting.Cqrs
+
+# Concrete handler registration
+dotnet add package Masa.Contrib.ReadWriteSplitting.Cqrs
+```
+
+---
+
+## Command
+
+`Command` is the abstract base record for write-side operations. It implements `ICommand` and `ITransaction`, which means each command automatically carries an `IUnitOfWork` reference threaded through by the EventBus middleware.
+
+```csharp
+public abstract record Command : ICommand
+{
+    [NotMapped]
+    [JsonIgnore]
+    public IUnitOfWork? UnitOfWork { get; set; }
+
+    protected Command() : this(Guid.NewGuid(), DateTime.UtcNow) { }
+
+    public Guid GetEventId()           => /* internal _eventId */;
+    public DateTime GetCreationTime()  => /* internal _creationTime */;
+    public void SetEventId(Guid id)    => /* ... */;
+    public void SetCreationTime(DateTime dt) => /* ... */;
+}
+```
+
+<Note>
+  Because `Command` implements `ITransaction`, the `TransactionEventMiddleware` automatically wraps every command handler in a UoW transaction when `UseUoW<TDbContext>()` is registered.
+</Note>
+
+---
+
+## Query&lt;TResult&gt;
+
+`Query<TResult>` is the abstract base record for read-side operations. The handler writes its return value into the `Result` property, which the caller reads after `PublishAsync` completes.
+
+```csharp
+public abstract record Query<TResult> : IQuery<TResult>
+{
+    public abstract TResult Result { get; set; }
+
+    protected Query() : this(Guid.NewGuid(), DateTime.UtcNow) { }
+    // GetEventId, GetCreationTime, SetEventId, SetCreationTime
+}
+```
+
+Queries do **not** implement `ITransaction` — they are read-only operations and never participate in database transactions.
+
+---
+
+## Handler Interfaces
+
+`ICommandHandler<TCommand>` and `IQueryHandler<TQuery, TResult>` both extend `IEventHandler<T>`, so they integrate seamlessly with the EventBus handler discovery and `[EventHandler]` attribute approach.
+
+```csharp
+public interface ICommandHandler<TCommand> : IEventHandler<TCommand>
+    where TCommand : ICommand { }
+
+public interface IQueryHandler<TCommand, TResult> : IEventHandler<TCommand>
+    where TCommand : IQuery<TResult> { }
+```
+
+You can implement either the interface or use the `[EventHandler]` attribute on a plain method — both work identically.
+
+---
+
+## Registration
+
+```csharp
+builder.Services
+    .AddEventBus(eventBusBuilder =>
+        eventBusBuilder.UseUoW<ShopDbContext>(opts =>
+            opts.UseSqlServer(connStr)));
+```
+
+`AddEventBus()` scans all assemblies for handler types and registers them automatically. There is no separate `AddCqrs()` call required — CQRS types are first-class citizens of the EventBus.
+
+---
+
+## Code Examples
+
+### 1 — Define a command (write side)
+
+```csharp
+public record CreateOrderCommand : Command
+{
+    public string CustomerName { get; init; } = string.Empty;
+    public List<OrderItemDto> Items { get; init; } = new();
+}
+
+public record OrderItemDto
+{
+    public string ProductId { get; init; } = string.Empty;
+    public int Quantity { get; init; }
+}
+```
+
+### 2 — Define a query (read side)
+
+```csharp
+public record GetOrderQuery : Query<OrderDto?>
+{
+    public Guid OrderId { get; init; }
+    public override OrderDto? Result { get; set; }
+}
+
+public record OrderDto
+{
+    public Guid Id { get; init; }
+    public string CustomerName { get; init; } = string.Empty;
+    public string Status { get; init; } = string.Empty;
+    public List<OrderItemDto> Items { get; init; } = new();
+}
+```
+
+### 3 — Command handler
+
+```csharp
+public class OrderCommandHandler
+{
+    private readonly IOrderRepository _repo;
+
+    public OrderCommandHandler(IOrderRepository repo) => _repo = repo;
+
+    [EventHandler]
+    public async Task HandleAsync(CreateOrderCommand command)
+    {
+        var order = new Order(Guid.NewGuid(), command.CustomerName);
+
+        foreach (var item in command.Items)
+            order.AddItem(new OrderItem(
+                Guid.NewGuid(),
+                item.ProductId,
+                item.Quantity));
+
+        await _repo.AddAsync(order);
+        // TransactionEventMiddleware persists and commits automatically
+    }
+}
+```
+
+### 4 — Query handler
+
+```csharp
+public class OrderQueryHandler
+{
+    private readonly ShopDbContext _context;
+
+    public OrderQueryHandler(ShopDbContext context) => _context = context;
+
+    [EventHandler]
+    public async Task HandleAsync(GetOrderQuery query)
+    {
+        var order = await _context.Orders
+            .AsNoTracking()
+            .Where(o => o.Id == query.OrderId)
+            .Select(o => new OrderDto
+            {
+                Id = o.Id,
+                CustomerName = o.CustomerName,
+                Status = o.Status
+            })
+            .FirstOrDefaultAsync();
+
+        query.Result = order;
+    }
+}
+```
+
+### 5 — Dispatch from a Minimal API service
+
+```csharp
+public class OrderService : ServiceBase
+{
+    public async Task<IResult> CreateAsync(
+        [FromBody] CreateOrderCommand cmd,
+        [FromServices] IEventBus eventBus)
+    {
+        await eventBus.PublishAsync(cmd);
+        return Results.Ok();
+    }
+
+    public async Task<IResult> GetAsync(
+        Guid id,
+        [FromServices] IEventBus eventBus)
+    {
+        var query = new GetOrderQuery { OrderId = id };
+        await eventBus.PublishAsync(query);
+
+        return query.Result is not null
+            ? Results.Ok(query.Result)
+            : Results.NotFound();
+    }
+}
+```
+
+---
+
+## Read/Write Model Separation
+
+One of the key benefits of CQRS is the ability to use a different read model or read database for queries. Because query handlers are independent classes, you can inject a read-optimized connection, a different `DbContext` with `AsNoTracking()`, or even a Redis cache — without touching the write-side domain model.
+
+```csharp
+// Write side: domain model with full change tracking + domain events
+public class OrderCommandHandler
+{
+    private readonly IOrderRepository _writeRepo; // EF Core + UoW
+    // ...
+}
+
+// Read side: lightweight DTO projection, no EF tracking
+public class OrderQueryHandler
+{
+    private readonly IOrderReadRepository _readRepo; // Dapper / separate read DB
+    // ...
+}
+```
+
+---
+
+## Event Sourcing
+
+For services that need a full event-sourced store, the `Masa.BuildingBlocks.ReadWriteSplitting.EventSourcing` package extends the CQRS abstractions with an event-sourced aggregate root and event store interfaces. This integrates with the same `IEventBus` dispatch pipeline.
+
+```bash
+dotnet add package Masa.BuildingBlocks.ReadWriteSplitting.EventSourcing
+```
+
+<Tip>
+  Start with the standard CQRS model. Event sourcing adds complexity (event replay, snapshots, schema evolution) that is only warranted when you need a complete audit trail or temporal queries over aggregate history.
+</Tip>

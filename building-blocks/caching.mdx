@@ -1,0 +1,269 @@
+---
+title: "Caching: Distributed and Multi-Level Cache in MASA Framework"
+sidebarTitle: "Caching"
+description: "MASA Framework provides IDistributedCacheClient and IMultilevelCacheClient with Redis support, pub/sub, key pattern queries, and automatic cache key formatting."
+---
+
+MASA Framework's caching layer sits above `IDistributedCache` and provides a richer API: typed key formatting, pattern-based queries, pub/sub channel support, atomic increment/decrement operations, and a two-tier multi-level cache that combines in-memory L1 with a distributed L2 backend. Redis is the primary supported backend via `StackExchange.Redis`.
+
+## Installation
+
+```bash
+# Distributed cache with Redis backend
+dotnet add package Masa.Contrib.Caching.Distributed.StackExchangeRedis
+
+# Multi-level cache (memory + distributed)
+dotnet add package Masa.Contrib.Caching.MultilevelCache
+```
+
+## Registration
+
+### Distributed Cache (Redis)
+
+```csharp
+builder.Services.AddDistributedCache(options =>
+    options.UseStackExchangeRedisCache("localhost:6379"));
+```
+
+Pass a full `StackExchange.Redis` configuration string, or provide a `ConfigurationOptions` object for advanced settings:
+
+```csharp
+builder.Services.AddDistributedCache(options =>
+    options.UseStackExchangeRedisCache(redisOptions =>
+    {
+        redisOptions.Servers = new List<RedisServerOptions>
+        {
+            new() { Host = "localhost", Port = 6379 }
+        };
+        redisOptions.DefaultDatabase = 1;
+    }));
+```
+
+### Multi-Level Cache
+
+```csharp
+builder.Services.AddMultilevelCache(distributedCacheOptions =>
+    distributedCacheOptions.UseStackExchangeRedisCache("localhost:6379"));
+```
+
+The multi-level cache automatically synchronises L1 (memory) eviction across instances using a Redis pub/sub channel, ensuring all nodes see consistent data after an invalidation.
+
+## `IDistributedCacheClient` API Reference
+
+### Get
+
+```csharp
+// Single key
+T? Get<T>(string key);
+Task<T?> GetAsync<T>(string key, CancellationToken token = default);
+
+// Multiple keys — returns list preserving input order (null for missing keys)
+IEnumerable<T?> GetList<T>(IEnumerable<string> keys);
+Task<IEnumerable<T?>> GetListAsync<T>(IEnumerable<string> keys, ...);
+```
+
+### Get-or-Set
+
+`GetOrSet` atomically returns a cached value or populates the cache by invoking the factory delegate:
+
+```csharp
+T? GetOrSet<T>(string key, Func<CacheEntry<T>> setter);
+Task<T?> GetOrSetAsync<T>(string key, Func<CacheEntry<T>> setter, ...);
+```
+
+`CacheEntry<T>` wraps the value with optional expiry:
+
+```csharp
+new CacheEntry<T>(value)                                 // no expiry
+new CacheEntry<T>(value, TimeSpan.FromMinutes(10))       // sliding expiry
+new CacheEntry<T>(value, DateTimeOffset.UtcNow.AddHours(1)) // absolute expiry
+```
+
+### Set
+
+```csharp
+void Set<T>(string key, T value, CacheEntryOptions? options = null);
+Task SetAsync<T>(string key, T value, CacheEntryOptions? options = null, ...);
+
+// Bulk set
+void SetList<T>(Dictionary<string, T> keyValues, CacheEntryOptions? options = null);
+Task SetListAsync<T>(Dictionary<string, T> keyValues, ...);
+```
+
+### Remove and Refresh
+
+```csharp
+// Remove one or more keys
+void Remove(params string[] keys);
+Task RemoveAsync(params string[] keys, ...);
+
+// Reset the sliding expiry window
+void Refresh(params string[] keys);
+Task RefreshAsync(params string[] keys, ...);
+```
+
+### Key Existence and Pattern Queries
+
+```csharp
+bool Exists(string key);
+bool Exists<T>(string key, Action<CacheOptions>? options = null);
+Task<bool> ExistsAsync<T>(string key, ...);
+
+// Find all keys matching a Redis glob pattern
+IEnumerable<string> GetKeys(string keyPattern);
+IEnumerable<string> GetKeys<T>(string keyPattern, Action<CacheOptions>? options = null);
+Task<IEnumerable<string>> GetKeysAsync(string keyPattern, ...);
+
+// Fetch values for all keys matching a pattern
+IEnumerable<T?> GetByKeyPattern<T>(string keyPattern);
+Task<IEnumerable<T?>> GetByKeyPatternAsync<T>(string keyPattern, ...);
+```
+
+### Pub/Sub
+
+MASA caching exposes Redis channels as first-class operations:
+
+```csharp
+// Publish a message to a channel
+void Publish(string channel, Action<PublishOptions> options);
+Task PublishAsync(string channel, Action<PublishOptions> options, ...);
+
+// Subscribe to a channel
+void Subscribe<T>(string channel, Action<SubscribeOptions<T>> options);
+Task SubscribeAsync<T>(string channel, Action<SubscribeOptions<T>> options, ...);
+
+// Unsubscribe
+void UnSubscribe<T>(string channel);
+Task UnSubscribeAsync<T>(string channel, ...);
+```
+
+### Atomic Increment and Decrement
+
+```csharp
+// Increment — creates the key with `value` if absent
+Task<long> HashIncrementAsync(string key, long value = 1,
+    Action<CacheOptions>? options = null, ...);
+
+// Decrement — never goes below `defaultMinVal` (default 0)
+Task<long> HashDecrementAsync(string key, long value = 1,
+    long defaultMinVal = 0, Action<CacheOptions>? options = null, ...);
+```
+
+### Key Expiry
+
+```csharp
+void KeyExpire(string key, TimeSpan? absoluteExpiration);
+void KeyExpire<T>(string key, DateTimeOffset absoluteExpiration,
+    Action<CacheOptions>? options = null);
+Task KeyExpireAsync(string key, CacheEntryOptions? options, ...);
+// ... several additional overloads for TimeSpan and DateTimeOffset
+```
+
+## Cache Key Formatting
+
+By default, MASA prepends a type-based prefix to every key, preventing collisions between different cached types stored in the same Redis database.
+
+`CacheKeyType` controls the format:
+
+| Value | Key format |
+|---|---|
+| `TypeName` (default) | `{FullTypeName}_{key}` |
+| `TypeAlias` | `{ShortAlias}_{key}` |
+| `None` | `{key}` (no prefix) |
+
+Override formatting per-call using the `Action<CacheOptions>` parameter:
+
+```csharp
+await _cache.GetAsync<Product>(id, options =>
+    options.CacheKeyType = CacheKeyType.None);
+```
+
+## Usage Examples
+
+### GetOrSet, Invalidation, and Atomic Counter
+
+```csharp
+public class ProductService
+{
+    private readonly IDistributedCacheClient _cache;
+
+    public ProductService(IDistributedCacheClient cache) => _cache = cache;
+
+    public async Task<Product?> GetProductAsync(Guid id)
+        => await _cache.GetOrSetAsync<Product>(
+            id.ToString(),
+            () => new CacheEntry<Product>(
+                FetchFromDb(id), TimeSpan.FromMinutes(10)));
+
+    public async Task InvalidateAsync(Guid id)
+        => await _cache.RemoveAsync(id.ToString());
+
+    public async Task<long> IncrementViewCountAsync(string productId)
+        => await _cache.HashIncrementAsync($"views:{productId}");
+
+    public async Task<long> DecrementStockAsync(string productId, long qty)
+        => await _cache.HashDecrementAsync(
+            $"stock:{productId}", qty, defaultMinVal: 0);
+}
+```
+
+### Pub/Sub for Cache Invalidation
+
+```csharp
+// Publisher — invalidate a product across all instances
+await _cache.PublishAsync("product-invalidated", options =>
+    options.Value = productId.ToString());
+
+// Subscriber — typically in a background service or startup
+await _cache.SubscribeAsync<string>("product-invalidated", options =>
+{
+    options.Subscribe = async (productId) =>
+    {
+        await _cache.RemoveAsync(productId);
+    };
+});
+```
+
+### Pattern-Based Query
+
+```csharp
+// Remove all cached product pages for a category
+var keys = await _cache.GetKeysAsync<Product>("category:electronics:*");
+await _cache.RemoveAsync(keys.ToArray());
+```
+
+## Multi-Level Cache (`IMultilevelCacheClient`)
+
+`IMultilevelCacheClient` is a drop-in replacement for `IDistributedCacheClient` that adds an in-process memory layer:
+
+```csharp
+public class CatalogService
+{
+    private readonly IMultilevelCacheClient _cache;
+
+    public CatalogService(IMultilevelCacheClient cache) => _cache = cache;
+
+    public async Task<Category?> GetCategoryAsync(int id)
+        => await _cache.GetOrSetAsync<Category>(
+            id.ToString(),
+            () => new CacheEntry<Category>(
+                LoadCategory(id), TimeSpan.FromHours(1)));
+}
+```
+
+On a cache hit the value is served from L1 memory without a Redis round-trip. On a miss the value is loaded from Redis (L2) and promoted to memory. When a key is removed or updated on any node, MASA publishes an invalidation message to the shared pub/sub channel so every node evicts its local copy immediately.
+
+### Memory Cache Options
+
+Tune the L1 layer at registration:
+
+```csharp
+builder.Services.AddMultilevelCache(
+    memoryCacheOptions =>
+    {
+        memoryCacheOptions.ExpirationScanFrequency = TimeSpan.FromMinutes(1);
+        memoryCacheOptions.SizeLimit = 1024;
+    },
+    distributedCacheOptions =>
+        distributedCacheOptions.UseStackExchangeRedisCache("localhost:6379"));
+```

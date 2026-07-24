@@ -1,0 +1,246 @@
+---
+title: "Unit of Work: Transaction Management in MASA Framework"
+sidebarTitle: "Unit of Work"
+description: "IUnitOfWork coordinates EF Core transactions with SaveChangesAsync, CommitAsync, and RollbackAsync, dispatching domain events via EventBus on commit."
+---
+
+The Unit of Work (UoW) pattern groups a set of database operations into a single atomic transaction and defers domain-event dispatch until the transaction succeeds. MASA Framework's `IUnitOfWork` is the central coordinator between your EF Core `DbContext`, the `IDomainEventBus`, and the `IEventBus` pipeline — ensuring that domain events are only raised after data has been safely committed.
+
+## Installation
+
+```bash
+dotnet add package Masa.Contrib.Data.UoW.EFCore
+```
+
+---
+
+## IUnitOfWork Interface
+
+```csharp
+public interface IUnitOfWork : IDisposable, IAsyncDisposable
+{
+    IServiceProvider ServiceProvider { get; }
+    DbTransaction Transaction { get; }
+
+    bool TransactionHasBegun { get; }
+    bool? UseTransaction { get; set; }
+    bool DisableRollbackOnFailure { get; set; }
+
+    EntityState EntityState { get; set; }
+    CommitState CommitState { get; set; }
+
+    Task SaveChangesAsync(CancellationToken cancellationToken = default);
+    Task CommitAsync(CancellationToken cancellationToken = default);
+    Task RollbackAsync(CancellationToken cancellationToken = default);
+}
+```
+
+### Properties
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `ServiceProvider` | `IServiceProvider` | The scoped service provider for this unit of work |
+| `Transaction` | `DbTransaction` | The active database transaction (throws if not begun) |
+| `TransactionHasBegun` | `bool` | Whether a transaction is currently open |
+| `UseTransaction` | `bool?` | Force on/off; `null` lets the provider decide per scenario |
+| `DisableRollbackOnFailure` | `bool` | When `true`, skips automatic rollback on exception |
+| `EntityState` | `EntityState` | `UnChanged` or `Changed` — whether EF has pending writes |
+| `CommitState` | `CommitState` | `UnCommited` (open transaction) or `Commited` |
+
+### Methods
+
+| Method | Description |
+|--------|-------------|
+| `SaveChangesAsync()` | Persists tracked changes to the database via `DbContext.SaveChangesAsync()`. Also enqueues any pending domain events via `IDomainEventBus`. |
+| `CommitAsync()` | Commits the open transaction and calls `IDomainEventBus.PublishQueueAsync()` to dispatch all enqueued domain events. |
+| `RollbackAsync()` | Rolls back the transaction. Pending domain events are discarded with the transaction. |
+
+---
+
+## EntityState and CommitState
+
+```csharp
+public enum EntityState
+{
+    UnChanged, // No tracked changes since last save
+    Changed    // Pending changes exist
+}
+
+public enum CommitState
+{
+    UnCommited, // Transaction open and data has changed
+    Commited    // No open transaction or data unchanged
+}
+```
+
+---
+
+## ITransaction Interface
+
+`ITransaction` is the marker interface that commands and events carry to propagate the `IUnitOfWork` through the handling pipeline.
+
+```csharp
+public interface ITransaction
+{
+    [NotMapped]
+    [JsonIgnore]
+    IUnitOfWork? UnitOfWork { get; set; }
+}
+```
+
+`IDomainEvent`, `DomainCommand`, and the CQRS `Command` type all implement `ITransaction`, allowing the `TransactionEventMiddleware` to coordinate transactions automatically.
+
+---
+
+## Registration
+
+### Via AddMasaDbContext (recommended)
+
+```csharp
+builder.Services
+    .AddEventBus()
+    .AddMasaDbContext<ShopDbContext>(opts =>
+        opts.UseSqlServer(
+            builder.Configuration.GetConnectionString("DefaultConnection"))
+            .UseUoW());         // registers IUnitOfWork backed by ShopDbContext
+```
+
+### Via EventBus builder
+
+```csharp
+builder.Services
+    .AddEventBus(eventBusBuilder =>
+        eventBusBuilder.UseUoW<ShopDbContext>(opts =>
+            opts.UseSqlServer(connStr)));
+```
+
+---
+
+## TransactionEventMiddleware
+
+When `UseUoW<TDbContext>()` is configured, the EventBus automatically inserts `TransactionEventMiddleware<TEvent>` around every event handler. This middleware:
+
+1. Sets `UseTransaction = true` on the `IUnitOfWork` if not already configured
+2. Awaits the handler pipeline (`next()`)
+3. Calls `SaveChangesAsync()` then `CommitAsync()` on success
+4. Calls `RollbackAsync()` on any exception (unless `DisableRollbackOnFailure = true`)
+
+This means **you almost never need to interact with `IUnitOfWork` directly** in command handlers. The middleware handles the full save-and-commit lifecycle.
+
+```csharp
+// TransactionEventMiddleware logic (simplified from source)
+public override async Task HandleAsync(TEvent @event, EventHandlerDelegate next)
+{
+    try
+    {
+        if (_unitOfWork is { UseTransaction: null })
+            _unitOfWork.UseTransaction = true;
+
+        await next();
+
+        if (_unitOfWork != null)
+        {
+            await _unitOfWork.SaveChangesAsync();
+            await _unitOfWork.CommitAsync();
+        }
+    }
+    catch (Exception)
+    {
+        if (_unitOfWork is { DisableRollbackOnFailure: false })
+            await _unitOfWork!.RollbackAsync();
+        throw;
+    }
+}
+```
+
+---
+
+## Usage in Command Handlers
+
+The typical pattern with CQRS — the UoW is managed entirely by the middleware:
+
+```csharp
+builder.Services
+    .AddEventBus()
+    .AddMasaDbContext<ShopDbContext>(opts =>
+        opts.UseSqlServer(connStr).UseUoW());
+
+public class OrderCommandHandler
+{
+    private readonly IOrderRepository _repo;
+
+    public OrderCommandHandler(IOrderRepository repo) => _repo = repo;
+
+    [EventHandler]
+    public async Task CreateOrderAsync(CreateOrderCommand command)
+    {
+        var order = new Order(Guid.NewGuid(), command.CustomerName);
+
+        foreach (var item in command.Items)
+            order.AddItem(new OrderItem(item.ProductId, item.Quantity));
+
+        await _repo.AddAsync(order);
+        // TransactionEventMiddleware calls SaveChangesAsync + CommitAsync
+        // after this method returns. Domain events are dispatched on CommitAsync.
+    }
+}
+```
+
+---
+
+## Manual UoW Control
+
+For scenarios outside the EventBus pipeline — such as background jobs or scripts — inject `IUnitOfWork` directly:
+
+```csharp
+public class OrderBatchService
+{
+    private readonly IOrderRepository _repo;
+    private readonly IUnitOfWork _uow;
+
+    public OrderBatchService(IOrderRepository repo, IUnitOfWork uow)
+    {
+        _repo = repo;
+        _uow = uow;
+    }
+
+    public async Task ImportOrdersAsync(IEnumerable<OrderImportDto> imports)
+    {
+        try
+        {
+            foreach (var dto in imports)
+            {
+                var order = new Order(Guid.NewGuid(), dto.CustomerName);
+                await _repo.AddAsync(order);
+            }
+
+            await _uow.SaveChangesAsync();
+            await _uow.CommitAsync();
+        }
+        catch
+        {
+            await _uow.RollbackAsync();
+            throw;
+        }
+    }
+}
+```
+
+---
+
+## Transaction Options
+
+Control transaction behavior when registering the UoW:
+
+```csharp
+builder.Services.AddMasaDbContext<ShopDbContext>(opts =>
+    opts.UseSqlServer(connStr)
+        .UseUoW(
+            disableRollbackOnFailure: false, // default: auto-rollback on exception
+            useTransaction: true             // default: null (provider decides)
+        ));
+```
+
+<Note>
+  Setting `useTransaction: false` is useful for read-heavy services or tests where transactional overhead is undesirable. Domain events are still dispatched via `CommitAsync`, but no database transaction is opened.
+</Note>

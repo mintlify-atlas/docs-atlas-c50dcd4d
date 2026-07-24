@@ -1,0 +1,197 @@
+---
+title: "Background Jobs: Queued and Scheduled Tasks in MASA Framework"
+sidebarTitle: "Background Jobs"
+description: "MASA Framework background jobs support fire-and-forget, delayed, and recurring tasks via IBackgroundJobManager with Hangfire or in-memory provider implementations."
+---
+
+MASA Framework's Background Jobs building block lets you offload work from the request thread — send emails, generate reports, or run periodic maintenance tasks — with a clean, provider-agnostic API. Switch between an in-memory provider for development and Hangfire for production by changing a single registration line.
+
+## Installation
+
+```bash
+dotnet add package Masa.Contrib.Extensions.BackgroundJobs          # core abstractions
+dotnet add package Masa.Contrib.Extensions.BackgroundJobs.Hangfire  # production provider
+dotnet add package Masa.Contrib.Extensions.BackgroundJobs.Memory    # dev/test provider
+```
+
+## Core Interfaces and Classes
+
+### `IBackgroundJobManager`
+
+The primary entry point for enqueuing and scheduling work:
+
+| Method | Description |
+|---|---|
+| `EnqueueAsync<TArgs>(TArgs args)` | Enqueue a fire-and-forget job to run as soon as possible |
+| `EnqueueAsync<TArgs>(TArgs args, TimeSpan delay)` | Enqueue a job to run after the specified delay |
+| `AddOrUpdateScheduleAsync(IBackgroundScheduleJob)` | Register or update a recurring (cron) job |
+
+### `BackgroundJobBase<TArgs>`
+
+The recommended base class for implementing jobs. Override `ExecutingAsync` with your business logic; the framework calls `PreExecuteAsync` and `PostExecuteAsync` as lifecycle hooks:
+
+| Member | Modifier | Description |
+|---|---|---|
+| `ExecutingAsync(TArgs args)` | `abstract` | Your job logic — always override this |
+| `PreExecuteAsync(TArgs args)` | `virtual` | Runs before execution; logs job start by default |
+| `PostExecuteAsync(TArgs args)` | `virtual` | Runs after execution; logs job completion by default |
+| `ExecuteAsync(TArgs args)` | sealed | Orchestrates Pre → Executing → Post |
+
+### Supporting Types
+
+| Type | Description |
+|---|---|
+| `IBackgroundJob<TArgs>` | Interface alternative to `BackgroundJobBase<TArgs>` |
+| `IBackgroundScheduleJob` | Contract for recurring jobs; implement via `BackgroundScheduleJobBase` |
+| `BackgroundJobNameAttribute` | Override the default job name derived from the class name |
+| `JobContext` | Contextual metadata available during job execution |
+| `IBackgroundJobProcessor` | Implement to insert custom processing pipeline steps |
+
+## Registration
+
+### Hangfire (Production)
+
+```csharp
+builder.Services.AddBackgroundJobs(jobs =>
+    jobs.UseHangfire(config =>
+        config.UseSqlServerStorage(connectionString)));
+```
+
+### In-Memory (Development / Testing)
+
+```csharp
+builder.Services.AddBackgroundJobs(jobs => jobs.UseInMemory());
+```
+
+<Info>
+  The in-memory provider executes jobs synchronously within the same process and does not survive application restarts. Use it only for local development and unit tests.
+</Info>
+
+## Defining a Job
+
+Separate the job arguments (a plain record or class) from the job implementation. This keeps args serializable and your job unit-testable in isolation:
+
+```csharp
+// Job arguments — must be serializable
+public record SendEmailArgs
+{
+    public string To { get; init; } = string.Empty;
+    public string Subject { get; init; } = string.Empty;
+    public string Body { get; init; } = string.Empty;
+}
+
+// Job implementation
+[BackgroundJobName("SendEmail")]
+public class SendEmailJob : BackgroundJobBase<SendEmailArgs>
+{
+    private readonly IEmailService _email;
+
+    public SendEmailJob(IEmailService email) => _email = email;
+
+    protected override async Task ExecutingAsync(SendEmailArgs args)
+        => await _email.SendAsync(args.To, args.Subject, args.Body);
+}
+```
+
+<Tip>
+  Decorate your job class with `[BackgroundJobName]` to assign a stable name. Without it the framework uses the fully qualified type name, which can break job discovery after refactoring.
+</Tip>
+
+## Enqueuing Jobs
+
+Inject `IBackgroundJobManager` wherever you need to dispatch work:
+
+```csharp
+public class OrderService
+{
+    private readonly IBackgroundJobManager _jobs;
+
+    public OrderService(IBackgroundJobManager jobs) => _jobs = jobs;
+
+    public async Task PlaceOrderAsync(Order order)
+    {
+        // ... persist order ...
+
+        // Fire-and-forget: send confirmation email immediately
+        await _jobs.EnqueueAsync(new SendEmailArgs
+        {
+            To      = order.CustomerEmail,
+            Subject = "Order confirmed",
+            Body    = $"Your order #{order.Id} is confirmed."
+        });
+
+        // Delayed: send a follow-up reminder after 5 minutes
+        await _jobs.EnqueueAsync(
+            new SendEmailArgs
+            {
+                To      = order.CustomerEmail,
+                Subject = "How's your order?",
+                Body    = "Your order is on its way."
+            },
+            TimeSpan.FromMinutes(5));
+    }
+}
+```
+
+## Recurring Jobs
+
+Extend `BackgroundScheduleJobBase` and register a cron expression to run jobs on a schedule:
+
+```csharp
+public class DailyReportJob : BackgroundScheduleJobBase
+{
+    // Cron expression: every day at 08:00 UTC
+    public override string CronExpression => "0 8 * * *";
+
+    private readonly IReportService _reports;
+
+    public DailyReportJob(IReportService reports) => _reports = reports;
+
+    protected override async Task ExecutingAsync()
+        => await _reports.GenerateDailySummaryAsync(DateTime.UtcNow.Date);
+}
+
+// Register at startup
+await backgroundJobManager.AddOrUpdateScheduleAsync(new DailyReportJob(reportService));
+```
+
+## Lifecycle Hooks
+
+Override `PreExecuteAsync` or `PostExecuteAsync` to add cross-cutting concerns such as distributed tracing, metrics, or audit logging without polluting `ExecutingAsync`:
+
+```csharp
+public class AuditedJob : BackgroundJobBase<MyArgs>
+{
+    private readonly IAuditLog _audit;
+
+    public AuditedJob(IAuditLog audit) => _audit = audit;
+
+    protected override async Task PreExecuteAsync(MyArgs args)
+    {
+        await _audit.RecordStartAsync(nameof(AuditedJob));
+        await base.PreExecuteAsync(args); // retains default logging
+    }
+
+    protected override async Task ExecutingAsync(MyArgs args)
+    {
+        // business logic
+    }
+
+    protected override async Task PostExecuteAsync(MyArgs args)
+    {
+        await _audit.RecordCompleteAsync(nameof(AuditedJob));
+        await base.PostExecuteAsync(args);
+    }
+}
+```
+
+## Provider Comparison
+
+| Feature | Memory | Hangfire |
+|---|---|---|
+| Persistence across restarts | ❌ | ✅ |
+| Dashboard UI | ❌ | ✅ |
+| Delayed jobs | ✅ | ✅ |
+| Recurring (cron) jobs | ✅ | ✅ |
+| Distributed workers | ❌ | ✅ |
+| Recommended environment | Dev / Test | Production |

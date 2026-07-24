@@ -1,47 +1,188 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with MASA Framework in .NET"
+sidebarTitle: "Quickstart"
+description: "Learn how to create your first MASA Framework microservice with EventBus, Minimal APIs, and EF Core in five steps using the dotnet CLI."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
+This guide walks you through building your first MASA Framework microservice from scratch. You will set up a project with automatic route mapping via `ServiceBase`, an in-process `EventBus`, and EF Core data access — all wired together in a minimal `Program.cs`. The entire setup takes about five minutes.
 
 ## Prerequisites
 
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+- [.NET 6 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/6.0) or later installed
+- Basic familiarity with ASP.NET Core Minimal APIs
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
 
-    ```bash
-    npm install your-package
-    ```
-  </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+### Install the MASA Template
 
-    ```bash
-    your-cli init
-    ```
-  </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+The fastest way to start is with the official project template. Install it globally from NuGet:
 
+```bash
+dotnet new --install Masa.Template
+```
+
+### Create Your Project
+
+Scaffold a new service named `MyService`:
+
+```bash
+dotnet new masafx -o MyService
+cd MyService
+```
+
+<Note>
+  You can also create the project from Visual Studio by selecting the **MASA Framework Project** template in the New Project dialog. The template pre-configures EventBus, Minimal APIs, and a sample service class.
+</Note>
+
+### (Alternative) Manual Setup
+
+If you prefer to add MASA Framework to an existing ASP.NET Core project, install the three core packages:
+
+<Tabs>
+  <Tab title=".NET CLI">
     ```bash
-    your-cli start
+    dotnet add package Masa.Contrib.Dispatcher.Events
+    dotnet add package Masa.Contrib.Service.MinimalAPIs
+    dotnet add package Masa.Contrib.Data.EFCore.SqlServer
     ```
-  </Step>
-</Steps>
+  </Tab>
+  <Tab title="Package Manager Console">
+    ```bash
+    Install-Package Masa.Contrib.Dispatcher.Events
+    Install-Package Masa.Contrib.Service.MinimalAPIs
+    Install-Package Masa.Contrib.Data.EFCore.SqlServer
+    ```
+  </Tab>
+  <Tab title="PackageReference (csproj)">
+    ```xml
+    <PackageReference Include="Masa.Contrib.Dispatcher.Events" />
+    <PackageReference Include="Masa.Contrib.Service.MinimalAPIs" />
+    <PackageReference Include="Masa.Contrib.Data.EFCore.SqlServer" />
+    ```
+  </Tab>
+</Tabs>
+
+| Package | Purpose |
+|---|---|
+| `Masa.Contrib.Dispatcher.Events` | In-process EventBus with `[EventHandler]` attribute scanning |
+| `Masa.Contrib.Service.MinimalAPIs` | Convention-based route auto-mapping via `ServiceBase` |
+| `Masa.Contrib.Data.EFCore.SqlServer` | EF Core integration for SQL Server |
+
+### Configure Program.cs
+
+Wire everything together in `Program.cs`. The key calls are `services.AddEventBus()`, `builder.AddServices()` (which discovers all `ServiceBase` subclasses), and `app.MapMasaMinimalAPIs()` (which maps their routes):
+
+```csharp
+var builder = WebApplication.CreateBuilder(args);
+
+// Register the in-process EventBus.
+// AddEventBus() scans MasaApp.GetAssemblies() for [EventHandler] methods automatically.
+builder.Services.AddEventBus();
+
+// AddServices() scans all loaded assemblies for ServiceBase subclasses,
+// registers them in DI, and returns the built WebApplication.
+// This call must come last before app.Run().
+var app = builder.AddServices();
+
+// MapMasaMinimalAPIs() iterates every registered ServiceBase and calls
+// AutoMapRoute(), translating method names to HTTP verbs and URL patterns.
+app.MapMasaMinimalAPIs();
+
+app.Run();
+```
+
+<Warning>
+  `builder.AddServices()` must be the **last** call on `builder` before `app.Run()`. Registering services after this call may not be reflected in the DI container.
+</Warning>
+
+### Define a Service and an Event Handler
+
+**Service class** — Inherit from `ServiceBase` and pass a base URI to the constructor. Public methods whose names start with a recognised HTTP verb prefix (`Get`, `Post`, `Put`, `Delete`) are mapped automatically. The `Async` suffix and the verb prefix are stripped from the route segment.
+
+```csharp
+public class OrderService : ServiceBase
+{
+    // All routes will be prefixed with /api/v1/orders
+    public OrderService() : base("/api/v1/orders") { }
+
+    // Mapped to: GET /api/v1/orders
+    public async Task<List<Order>> GetListAsync(
+        [FromServices] IOrderRepository repo)
+        => await repo.GetListAsync();
+
+    // Mapped to: POST /api/v1/orders
+    public async Task CreateAsync(
+        [FromBody] CreateOrderCommand cmd,
+        [FromServices] IEventBus eventBus)
+        => await eventBus.PublishAsync(cmd);
+}
+```
+
+`ServiceBase` exposes:
+
+- `BaseUri` — the route prefix set in the constructor.
+- `App` — the `WebApplication` instance, resolved via `MasaApp`.
+- `Services` — the global `IServiceCollection`.
+- `GetRequiredService<T>()` — convenience wrapper over the request `IServiceProvider`.
+
+**Event and handler** — Declare a plain class that implements the command, then use `[EventHandler]` to mark the handling method. `AddEventBus()` discovers this class automatically through assembly scanning:
+
+```csharp
+// The command event — inherits from the framework Event base
+public record CreateOrderCommand(string Name) : Event;
+
+// The handler class — no interface required, just [EventHandler]
+public class OrderCommandHandler
+{
+    [EventHandler]
+    public async Task HandleCreateAsync(
+        CreateOrderCommand cmd,
+        IOrderRepository repo)
+        => await repo.AddAsync(new Order(cmd.Name));
+}
+```
 
 <Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
-
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+  Handler method parameters are resolved from the DI container automatically (similar to Minimal API parameter binding), so you do not need to inject services through the constructor — just declare them as method parameters.
 </Tip>
+
+</Steps>
+
+## Run the Service
+
+```bash
+dotnet run
+```
+
+Navigate to `https://localhost:<port>/api/v1/orders` to verify the `GET` endpoint is live. Use a tool like `curl` or Postman to test the `POST` endpoint:
+
+```bash
+curl -X POST https://localhost:<port>/api/v1/orders \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Widget"}'
+```
+
+## What Happens Under the Hood
+
+<Accordion title="How AddEventBus() scans for handlers">
+  `AddEventBus()` calls `MasaApp.GetAssemblies()` to obtain the loaded assembly list, then uses `DefaultDispatchNetworkProvider` to reflect over every type and find methods decorated with `[EventHandler]`. Each handler type is registered in DI at `ServiceLifetime.Scoped` by default. When `IEventBus.PublishAsync<TEvent>()` is called, the framework resolves the correct handler chain and executes it in declaration order (controlled by the `Order` property on the attribute).
+</Accordion>
+
+<Accordion title="How AddServices() discovers ServiceBase classes">
+  `builder.AddServices()` delegates to `ServiceCollectionExtensions.AddServices()`, which scans `MasaApp.GetAssemblies()` for all concrete types that inherit `ServiceBase`. Each discovered type is registered as a singleton in the DI container and its `Type` is recorded in `GlobalMinimalApiOptions.ServiceTypes` for use by `MapMasaMinimalAPIs()`.
+</Accordion>
+
+<Accordion title="How MapMasaMinimalAPIs() builds routes">
+  `MapMasaMinimalAPIs()` iterates `GlobalMinimalApiOptions.ServiceTypes`, resolves each `ServiceBase` instance from the DI container, and calls `serviceInstance.AutoMapRoute()`. That method reflects over the public instance methods declared directly on the class and calls `App.MapMethods()` (or `App.MapGet/Post/Put/Delete`) for each one, deriving the HTTP verb and URL segment from the method name prefix.
+</Accordion>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="sitemap" href="/architecture">
+    Understand the full BuildingBlocks/Contrib two-layer design and MasaApp internals.
+  </Card>
+  <Card title="Event Bus" icon="bolt" href="/building-blocks/event-bus">
+    Explore middleware pipelines, saga handlers, retry policies, and failure levels.
+  </Card>
+</CardGroup>

@@ -1,0 +1,177 @@
+---
+title: "AutoComplete Search with Elasticsearch in MASA Framework"
+sidebarTitle: "Search Engine"
+description: "Masa.Contrib.SearchEngine.AutoComplete.ElasticSearch provides IAutoCompleteClient for Elasticsearch-backed autocomplete with typed document indexing and querying."
+---
+
+`Masa.Contrib.SearchEngine.AutoComplete.ElasticSearch` brings strongly-typed, index-backed autocomplete to MASA Framework applications. It wraps the official Elasticsearch .NET client behind an `IAutoCompleteClient` abstraction so you can index domain objects, query them with AND/OR operator semantics, and swap the underlying Elasticsearch configuration without touching your feature code.
+
+<Note>
+  This package requires a running **Elasticsearch 7.x or 8.x** instance. Ensure your cluster is reachable from the application host and that the target index has sufficient replica and shard capacity for your expected document volume.
+</Note>
+
+## Installation
+
+```bash
+dotnet add package Masa.Contrib.SearchEngine.AutoComplete.ElasticSearch
+```
+
+## Core Abstractions
+
+### `IAutoCompleteClient`
+
+The primary interface for all autocomplete operations. It exposes methods to index documents and query them by partial text input:
+
+```csharp
+public interface IAutoCompleteClient
+{
+    Task<AutoCompleteQueryResult<TDocument>> GetAsync<TDocument>(
+        string query,
+        AutoCompleteOptions? options = null,
+        CancellationToken cancellationToken = default);
+
+    Task SetAsync<TDocument>(
+        AutoCompleteDocument<TDocument> document,
+        CancellationToken cancellationToken = default);
+
+    Task DeleteAsync(
+        string id,
+        CancellationToken cancellationToken = default);
+}
+```
+
+### `AutoCompleteClient`
+
+The Elasticsearch-backed implementation of `IAutoCompleteClient`. It communicates with Elasticsearch via the `ElasticClient` obtained from `IElasticClientProvider` and targets the index configured through `ElasticSearchAutoCompleteOptions`.
+
+### `IElasticClientProvider` / `DefaultElasticClientProvider`
+
+`IElasticClientProvider` is a thin abstraction that hands out the underlying `ElasticClient`. The default implementation, `DefaultElasticClientProvider`, constructs the client from the URI and authentication settings you supply during registration. You can replace it with a custom provider if you need connection pooling, sniffing, or certificate pinning.
+
+### `ElasticSearchBuilder`
+
+A fluent builder that wires index settings, operator defaults, and the Elasticsearch connection together. It is used internally by the `UseElasticSearch` extension method but can be extended for advanced scenarios.
+
+### `ElasticSearchAutoCompleteOptions`
+
+| Property | Type | Description |
+|---|---|---|
+| `IndexName` | `string` | Elasticsearch index to read from and write to |
+| `Alias` | `string?` | Optional index alias — useful for zero-downtime re-indexing |
+| `AutoCompleteOperator` | `Operator` | Per-query default — `AND` (all terms must match) or `OR` (any term matches) |
+| `DefaultOperator` | `Operator` | Fallback operator when none is specified at query time |
+| `Routing` | `string?` | Custom routing value to target a specific shard |
+
+## Registration
+
+Register the autocomplete service in your DI container. Use `UseIndex<TDocument>` to bind a CLR type to a named Elasticsearch index:
+
+```csharp
+builder.Services.AddAutoComplete(options =>
+    options.UseElasticSearch(es =>
+    {
+        es.UseElasticsearch(new Uri("http://localhost:9200"));
+
+        es.UseIndex<Product>(index =>
+        {
+            index.IndexName = "products";
+            index.AutoCompleteOperator = Operator.And;
+        });
+    }));
+```
+
+You can register multiple indexes by chaining additional `UseIndex<T>` calls:
+
+```csharp
+builder.Services.AddAutoComplete(options =>
+    options.UseElasticSearch(es =>
+    {
+        es.UseElasticsearch(new Uri("http://localhost:9200"));
+
+        es.UseIndex<Product>(index => index.IndexName = "products");
+        es.UseIndex<Article>(index => index.IndexName = "articles");
+    }));
+```
+
+Each `UseIndex<T>` call produces an independently configured `IAutoCompleteClient` that targets its own index. When you inject `IAutoCompleteClient` and call `GetAsync<Product>`, the framework routes the request to the `products` index automatically.
+
+## Indexing Documents
+
+Documents are wrapped in `AutoCompleteDocument<TDocument>`, which adds the `Id` and `Text` fields that Elasticsearch uses for full-text matching:
+
+```csharp
+public async Task IndexAsync(Product product)
+{
+    await _autoComplete.SetAsync(new AutoCompleteDocument<Product>
+    {
+        Id   = product.Id.ToString(),
+        Text = product.Name,   // the field searched during autocomplete queries
+        Value = product        // the full document returned in results
+    });
+}
+```
+
+`Text` is the field indexed for autocomplete. `Value` stores the original domain object and is returned as-is in query results so your UI has everything it needs to render a suggestion without a second round-trip.
+
+## Querying
+
+Inject `IAutoCompleteClient` and call `GetAsync<TDocument>` with the user's partial input:
+
+```csharp
+public class SearchService
+{
+    private readonly IAutoCompleteClient _autoComplete;
+
+    public SearchService(IAutoCompleteClient autoComplete)
+        => _autoComplete = autoComplete;
+
+    public async Task<List<AutoCompleteDocument<Product>>> SearchAsync(string query)
+    {
+        var response = await _autoComplete.GetAsync<Product>(query);
+        return response.Data;
+    }
+
+    public async Task IndexAsync(Product product)
+        => await _autoComplete.SetAsync(new AutoCompleteDocument<Product>
+        {
+            Id    = product.Id.ToString(),
+            Text  = product.Name,
+            Value = product
+        });
+}
+```
+
+`response.Data` is a `List<AutoCompleteDocument<TDocument>>` ordered by relevance score. Each item carries the full `Value` object, so you can bind directly to your API response model.
+
+## Operator Semantics
+
+The `AutoCompleteOperator` setting controls how multi-term queries are matched:
+
+| Operator | Behaviour | Example query `"red wool"` |
+|---|---|---|
+| `AND` | All terms must appear in `Text` | Only matches `"red wool coat"`, not `"red jacket"` |
+| `OR` | Any term triggers a match | Matches `"red jacket"`, `"wool scarf"`, or `"red wool coat"` |
+
+`AND` is typically the right default for autocomplete because users expect their typed words to narrow, not broaden, the result set. Switch to `OR` for broader discovery scenarios such as fuzzy tag search.
+
+## Deleting Documents
+
+Remove a document from the index by its ID:
+
+```csharp
+await _autoComplete.DeleteAsync(product.Id.ToString());
+```
+
+## Zero-Downtime Re-indexing with Aliases
+
+When you need to rebuild an index without causing downtime, configure an alias and swap the underlying index once the new one is ready:
+
+```csharp
+es.UseIndex<Product>(index =>
+{
+    index.IndexName = "products-v2";
+    index.Alias     = "products";       // application always queries "products"
+});
+```
+
+Your application code always targets the alias `products`. Re-point the alias in Elasticsearch to `products-v2` when your migration is complete — no application redeployment required.

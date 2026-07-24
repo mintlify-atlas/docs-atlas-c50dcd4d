@@ -1,0 +1,202 @@
+---
+title: "Integration Events: Cross-Service Messaging with Dapr"
+sidebarTitle: "Integration Events"
+description: "MASA Framework IntegrationEvents enables reliable cross-service pub/sub messaging via Dapr with outbox pattern support and EF Core event log persistence."
+---
+
+Integration Events extend MASA Framework's EventBus to cross process and service boundaries. Where in-process EventBus delivers events within a single application, IntegrationEvents publish messages to an external broker — backed by Dapr's pub/sub building block — so that any subscribed service in your mesh can react. The outbox pattern ensures no events are silently lost between your database commit and the broker publish.
+
+## Installation
+
+Install the core integration events package plus your chosen transport and persistence adapter:
+
+```bash
+# Core abstraction
+dotnet add package Masa.Contrib.Dispatcher.IntegrationEvents
+
+# Dapr transport
+dotnet add package Masa.Contrib.Dispatcher.IntegrationEvents.Dapr
+
+# EF Core outbox / event log
+dotnet add package Masa.Contrib.Dispatcher.IntegrationEvents.EventLogs.EFCore
+```
+
+## Core Abstractions
+
+### `IIntegrationEvent`
+
+Every integration event must implement `IIntegrationEvent`, which extends three interfaces:
+
+- **`IEvent`** — base event marker (shared with in-process EventBus)
+- **`ITopic`** — carries the pub/sub topic name
+- **`ITransaction`** — links to the current unit-of-work
+
+### `IntegrationEvent` Abstract Record
+
+`IntegrationEvent` is the recommended base class. It pre-implements `IIntegrationEvent` and provides:
+
+| Property | Type | Description |
+|---|---|---|
+| `EventId` | `Guid` | Unique event identifier, auto-generated |
+| `EvenCreateTime` | `DateTime` | UTC creation timestamp, auto-set |
+| `Topic` | `string` | Defaults to the class name; override to customise |
+| `UnitOfWork` | `IUnitOfWork?` | Injected by the framework before publishing |
+
+### `IIntegrationEventBus`
+
+`IIntegrationEventBus` extends `IEventBus` with the same `PublishAsync<TEvent>` signature. Internally it routes integration events through the outbox and Dapr transport while routing domain events to the local EventBus.
+
+## Defining an Integration Event
+
+```csharp
+public record OrderCreatedIntegrationEvent : IntegrationEvent
+{
+    // Override Topic to use a stable string instead of the class name
+    public override string Topic { get; set; } = nameof(OrderCreatedIntegrationEvent);
+
+    public Guid OrderId { get; init; }
+    public decimal TotalAmount { get; init; }
+}
+```
+
+## Registration
+
+Wire up the integration event bus, Dapr transport, and EF Core event log in `Program.cs`:
+
+```csharp
+builder.Services.AddIntegrationEventBus<IntegrationEventLogService>(options =>
+{
+    // Use Dapr as the pub/sub transport
+    options.UseDapr();
+
+    // Store outbox events in ShopDbContext
+    options.UseEventLog<ShopDbContext>();
+});
+```
+
+<Note>
+`IntegrationEventLogService` is the default EF Core implementation provided by
+`Masa.Contrib.Dispatcher.IntegrationEvents.EventLogs.EFCore`. Supply your own
+`IIntegrationEventLogService` implementation if you need a different persistence strategy.
+</Note>
+
+### EF Core Migration
+
+The event log creates its own table in your `DbContext`. Apply migrations after registration:
+
+```bash
+dotnet ef migrations add AddIntegrationEventLog
+dotnet ef database update
+```
+
+## Publishing an Integration Event
+
+Inject `IIntegrationEventBus` and publish exactly as you would with the local EventBus:
+
+```csharp
+public class OrderService : ServiceBase
+{
+    public async Task CreateOrderAsync(
+        [FromBody] CreateOrderRequest request,
+        [FromServices] IIntegrationEventBus eventBus)
+    {
+        // Domain logic here...
+
+        await eventBus.PublishAsync(new OrderCreatedIntegrationEvent
+        {
+            OrderId = Guid.NewGuid(),
+            TotalAmount = request.TotalAmount
+        });
+    }
+}
+```
+
+The framework stores the event in the outbox table within the same database transaction as your business data, then delivers it to Dapr asynchronously. This guarantees **at-least-once delivery** even if the process crashes after committing.
+
+## Outbox Pattern — How It Works
+
+The outbox pattern decouples your database commit from the broker publish in three steps:
+
+<Steps>
+  <Step title="Store">
+    When you call `PublishAsync`, the event is serialised and saved to the `IntegrationEventLog` table inside the same transaction as your business write.
+  </Step>
+  <Step title="Relay">
+    `IntegrationEventHostedService` (a background service registered automatically) polls for pending events and forwards them to the Dapr pub/sub sidecar.
+  </Step>
+  <Step title="Retry">
+    Failed deliveries are retried with back-off. Each event tracks its `State` (`NotPublished`, `InProgress`, `Published`, `PublishedFailed`).
+  </Step>
+</Steps>
+
+## Subscribing to an Integration Event
+
+Subscribers use the standard Dapr `[Topic]` attribute on a controller action. No MASA-specific packages are required on the subscriber side:
+
+```csharp
+[ApiController]
+public class OrderEventsController : ControllerBase
+{
+    private readonly ILogger<OrderEventsController> _logger;
+
+    public OrderEventsController(ILogger<OrderEventsController> logger)
+        => _logger = logger;
+
+    [Topic("pubsub", nameof(OrderCreatedIntegrationEvent))]
+    [HttpPost("/orders/created")]
+    public async Task HandleOrderCreated(
+        [FromBody] OrderCreatedIntegrationEvent @event)
+    {
+        _logger.LogInformation("Order {OrderId} received", @event.OrderId);
+        // handle the event...
+    }
+}
+```
+
+The first argument to `[Topic]` must match the Dapr pub/sub component name configured in your Dapr component YAML (`pubsub` by default in local development).
+
+## Background Retry Processor
+
+`IntegrationEventHostedService` is registered automatically when you call `AddIntegrationEventBus`. It runs on a configurable interval and:
+
+- Queries events in `NotPublished` or `PublishedFailed` state.
+- Attempts to publish each event via the configured transport.
+- Updates the event state to `Published` on success or increments the retry counter on failure.
+
+Configure the retry interval via options:
+
+```csharp
+builder.Services.AddIntegrationEventBus<IntegrationEventLogService>(options =>
+{
+    options.UseDapr();
+    options.UseEventLog<ShopDbContext>();
+    options.LocalRetryTimes = 3;
+    options.RetryIntervalMilliseconds = 1000;
+});
+```
+
+## Custom `IIntegrationEventLogService`
+
+If you need a non-EF Core persistence backend, implement `IIntegrationEventLogService` directly:
+
+```csharp
+public class MongoEventLogService : IIntegrationEventLogService
+{
+    public Task SaveEventAsync(IIntegrationEvent @event, IDbTransaction transaction)
+        => /* write to MongoDB */ Task.CompletedTask;
+
+    public Task<IEnumerable<IntegrationEventLog>> RetrieveEventLogsPendingToPublishAsync(Guid transactionId)
+        => /* query MongoDB */ Task.FromResult(Enumerable.Empty<IntegrationEventLog>());
+
+    public Task MarkEventAsPublishedAsync(Guid eventId) => Task.CompletedTask;
+    public Task MarkEventAsInProgressAsync(Guid eventId) => Task.CompletedTask;
+    public Task MarkEventAsFailedAsync(Guid eventId) => Task.CompletedTask;
+}
+```
+
+Then register it in place of `IntegrationEventLogService`:
+
+```csharp
+builder.Services.AddIntegrationEventBus<MongoEventLogService>(options =>
+    options.UseDapr());
+```

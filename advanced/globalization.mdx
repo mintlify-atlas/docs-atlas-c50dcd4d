@@ -1,0 +1,195 @@
+---
+title: "Internationalization with I18n in MASA Framework"
+sidebarTitle: "Globalization"
+description: "MASA Framework I18n supports file-based and DCC-remote localization with culture detection, embedded resources, and ASP.NET Core middleware integration."
+---
+
+MASA Framework's I18n building block gives your services first-class internationalization support without coupling your business logic to resource management details. Culture detection, resource loading, and string formatting are handled by the framework — you call `I18n.T("key")` and the right translation is returned for the active request culture.
+
+## Installation
+
+```bash
+dotnet add package Masa.Contrib.Globalization.I18n             # core engine
+dotnet add package Masa.Contrib.Globalization.I18n.AspNetCore  # ASP.NET Core middleware
+dotnet add package Masa.Contrib.Globalization.I18n.Dcc         # optional: DCC remote config
+```
+
+## Resource File Structure
+
+By convention, locale resources are JSON files named by IETF culture code and placed inside a resources directory. A `supportedCultures.json` file (or the name you configure) declares which cultures your application supports:
+
+```json
+["en-US", "zh-CN"]
+```
+
+Each culture file maps translation keys to their localized strings. Positional format placeholders (`{0}`, `{1}`, …) are supported for parameterized messages:
+
+```json
+{
+  "HelloWorld": "Hello, World!",
+  "OrderCreated": "Order {0} has been created.",
+  "Welcome": "Welcome back, {0}!"
+}
+```
+
+The Chinese counterpart lives alongside it:
+
+```json
+{
+  "HelloWorld": "你好，世界！",
+  "OrderCreated": "订单 {0} 已创建。",
+  "Welcome": "欢迎回来，{0}！"
+}
+```
+
+A typical layout looks like this:
+
+```
+Resources/
+├── supportedCultures.json
+├── en-US.json
+└── zh-CN.json
+```
+
+## Registration
+
+### File-Based Resources
+
+Point the framework at your resources directory during startup:
+
+```csharp
+// Minimal — loads from the "Resources" folder relative to the working directory
+builder.Services.AddI18n("Resources");
+
+// With full settings control
+builder.Services.AddI18n(settings =>
+{
+    settings.ResourcesDirectory = "Resources";
+    settings.SupportCultureFileName = "supportedCultures.json";
+});
+```
+
+### Embedded Resources
+
+For library authors or scenarios where you want to ship translations inside the assembly:
+
+```csharp
+builder.Services.AddI18nByEmbedded(
+    new[] { typeof(Program).Assembly },
+    "Resources");  // folder path inside the assembly
+```
+
+Mark your resource files as **Embedded Resource** in the `.csproj`:
+
+```xml
+<ItemGroup>
+  <EmbeddedResource Include="Resources\**\*.json" />
+</ItemGroup>
+```
+
+### DCC Remote Configuration
+
+When your translations are managed centrally in the MASA DCC (Distributed Configuration Center), pull them at runtime instead of baking them into the deployment artifact:
+
+```csharp
+builder.Services.AddI18nByDcc();
+```
+
+`DccI18nResourceContributor` fetches locale strings from DCC and keeps them synchronized with configuration-change notifications — no restart required to deploy translation updates.
+
+## ASP.NET Core Middleware
+
+Add `UseMasaLocalization()` to your middleware pipeline to automatically detect the request's preferred culture and set `CultureInfo.CurrentCulture` / `CultureInfo.CurrentUICulture`:
+
+```csharp
+app.UseMasaLocalization();
+
+// Must come after UseMasaLocalization so handlers run in the correct culture
+app.MapControllers();
+```
+
+Culture negotiation respects the `Accept-Language` header, a `culture` query parameter, and a culture cookie — in that order of precedence.
+
+## Translating Strings
+
+### Static `I18n` Class
+
+The `I18n` static class provides ambient access to translations without requiring dependency injection:
+
+```csharp
+// Simple key lookup
+string greeting = I18n.T("HelloWorld");         // "Hello, World!"
+
+// Parameterized message
+string msg = string.Format(I18n.T("OrderCreated"), orderId);
+```
+
+### Typed Resource Access with `I18n<TResource>`
+
+For larger applications, group related translations under a strongly typed resource class to avoid magic-string keys:
+
+```csharp
+// Marker class — no members required
+public class OrderResources { }
+
+// Inject the typed accessor
+public class OrderService
+{
+    private readonly I18n<OrderResources> _i18n;
+
+    public OrderService(I18n<OrderResources> i18n) => _i18n = i18n;
+
+    public string GetConfirmationMessage(string orderId)
+        => string.Format(_i18n.T("OrderCreated"), orderId);
+}
+```
+
+## Configuration Reference
+
+`CultureSettings` controls the I18n engine's behaviour:
+
+| Property | Default | Description |
+|---|---|---|
+| `ResourcesDirectory` | `"Resources"` | Relative or absolute path to locale JSON files |
+| `SupportCultureFileName` | `"supportedCultures.json"` | File that lists accepted culture codes |
+
+## Internal Architecture
+
+<AccordionGroup>
+  <Accordion title="I18nResource">
+    Represents a single loaded resource file. Holds the culture code and a key-value dictionary of translations.
+  </Accordion>
+  <Accordion title="I18nResourceDictionary">
+    The in-memory store that aggregates all loaded `I18nResource` instances and services key lookups. It is populated at startup and updated on remote-config push events when using DCC.
+  </Accordion>
+  <Accordion title="DccI18nResourceContributor">
+    Implements the resource contributor contract for DCC. Subscribes to DCC change events and refreshes the dictionary when a locale file is updated centrally.
+  </Accordion>
+</AccordionGroup>
+
+## Full Example
+
+```csharp
+// Program.cs
+builder.Services.AddI18n("Resources");
+
+app.UseMasaLocalization();
+
+// OrderController.cs
+[ApiController]
+[Route("orders")]
+public class OrderController : ControllerBase
+{
+    [HttpPost]
+    public IActionResult Create([FromBody] CreateOrderRequest request)
+    {
+        // I18n.T resolves against the culture detected by UseMasaLocalization()
+        var message = string.Format(I18n.T("OrderCreated"), request.OrderId);
+        return Ok(new { message });
+    }
+}
+```
+
+<Tip>
+  If a key is not found in the current culture's resource file, the framework falls back to the default culture configured in `supportedCultures.json`. Always provide complete translations for your default culture to avoid missing-key exceptions in production.
+</Tip>

@@ -1,0 +1,251 @@
+---
+title: "Domain Events: Raise and Handle Events from Aggregates"
+sidebarTitle: "Domain Events"
+description: "MASA Framework domain events let aggregates raise IDomainEvent records dispatched by EventBus, with built-in EntityCreated, Modified, and Deleted events."
+---
+
+Domain events are the mechanism through which aggregates communicate that something meaningful has happened in the business domain. In MASA Framework, every aggregate root carries an internal event queue. Events are raised by domain methods and dispatched automatically by the Unit of Work when changes are committed — keeping your domain model fully decoupled from the event bus infrastructure.
+
+## Packages
+
+```bash
+# Abstractions (domain model only)
+dotnet add package Masa.BuildingBlocks.Ddd.Domain
+
+# Concrete dispatcher and event bus wiring
+dotnet add package Masa.Contrib.Ddd.Domain
+```
+
+---
+
+## Core Abstractions
+
+### IDomainEvent
+
+`IDomainEvent` extends both `IEvent` (the base event interface) and `ITransaction`, meaning every domain event carries an optional `IUnitOfWork` reference that the framework uses to coordinate commit timing.
+
+```csharp
+public interface IDomainEvent : IEvent, ITransaction { }
+```
+
+### DomainEvent
+
+`DomainEvent` is the abstract record base for all custom domain events. It auto-assigns a new `EventId` (GUID) and `EvenCreateTime` (UTC) when instantiated via the default constructor.
+
+```csharp
+public abstract record DomainEvent(Guid EventId, DateTime EvenCreateTime) : IDomainEvent
+{
+    public IUnitOfWork? UnitOfWork { get; set; }
+
+    protected DomainEvent() : this(Guid.NewGuid(), DateTime.UtcNow) { }
+
+    public Guid GetEventId() => EventId;
+    public DateTime GetCreationTime() => EvenCreateTime;
+    // SetEventId / SetCreationTime for framework override support
+}
+```
+
+### DomainCommand
+
+`DomainCommand` is an abstract record for commands that originate from the domain layer itself (for example, a domain service triggering a side-effect). It shares the same shape as `DomainEvent` but is semantically a mutation request.
+
+```csharp
+public abstract record DomainCommand(Guid EventId, DateTime EvenCreateTime) : IDomainCommand
+{
+    public IUnitOfWork? UnitOfWork { get; set; }
+    protected DomainCommand() : this(Guid.NewGuid(), DateTime.UtcNow) { }
+}
+```
+
+### DomainQuery&lt;TResult&gt;
+
+`DomainQuery<TResult>` is an abstract record for queries dispatched from within the domain. It exposes an abstract `Result` property where the query handler writes its return value.
+
+```csharp
+public abstract record DomainQuery<TResult> : IDomainQuery<TResult>
+{
+    public abstract TResult Result { get; set; }
+    // UnitOfWork setter always throws — queries are read-only
+}
+```
+
+---
+
+## IDomainEventBus
+
+`IDomainEventBus` extends `IEventBus` with a queue-based dispatch model. When `MasaDbContext.SaveChangesAsync()` is called, it calls `EnqueueAsync` for all pending domain events on tracked aggregates. The queue is then flushed during `CommitAsync`.
+
+| Method | Description |
+|--------|-------------|
+| `EnqueueAsync<TDomainEvent>(event)` | Adds a domain event to the dispatch queue |
+| `PublishQueueAsync()` | Flushes all queued events through the EventBus |
+| `AnyQueueAsync()` | Returns `true` if there are queued events waiting |
+
+---
+
+## Built-in Entity Change Events
+
+`MasaDbContext` automatically raises structural domain events for every tracked aggregate root when EF Core detects a state change. These require no extra code in your entities.
+
+| Event type | Raised when |
+|------------|-------------|
+| `EntityCreatedDomainEvent<TEntity>` | An aggregate is in `EntityState.Added` on save |
+| `EntityModifiedDomainEvent<TEntity>` | An aggregate is in `EntityState.Modified` on save |
+| `EntityDeletedDomainEvent<TEntity>` | An aggregate is in `EntityState.Deleted` on save |
+| `EntityChangedEvent<TEntity>` | Base record for all three above types |
+
+You can handle these events globally to implement cross-cutting concerns such as audit logs or cache invalidation.
+
+---
+
+## Integration Domain Events
+
+For events that must cross service boundaries, extend `IntegrationDomainEvent` instead of `DomainEvent`. An integration domain event is both a domain event (handled in-process) and an integration event (published to the message broker via `IIntegrationEventBus`).
+
+```csharp
+public abstract record IntegrationDomainEvent : DomainEvent, IIntegrationDomainEvent
+{
+    public virtual string Topic { get; set; }
+    // Topic defaults to the class name if not overridden
+}
+```
+
+```csharp
+public record OrderPaymentSucceededIntegrationEvent : IntegrationDomainEvent
+{
+    public Guid OrderId { get; init; }
+    public decimal Amount { get; init; }
+
+    // Override Topic to use a stable message broker topic name
+    public override string Topic => "order-payment-succeeded";
+}
+```
+
+---
+
+## Dispatch Flow
+
+Understanding the flow helps you reason about ordering guarantees:
+
+<Steps>
+  <Step title="Aggregate raises event">
+    A domain method calls `AddDomainEvent(new MyEvent(...))`. The event sits in the aggregate's `_domainEvents` list.
+  </Step>
+  <Step title="SaveChangesAsync is called">
+    `MasaDbContext.SaveChangesAsync()` iterates all tracked `IGenerateDomainEvents` entries, calls `DomainEventBus.EnqueueAsync()` for each pending event, and clears the aggregate's event list.
+  </Step>
+  <Step title="UoW CommitAsync flushes events">
+    `IUnitOfWork.CommitAsync()` calls `IDomainEventBus.PublishQueueAsync()`, which dispatches all queued domain events through the in-process `IEventBus`. Integration domain events are also forwarded to the `IIntegrationEventBus`.
+  </Step>
+</Steps>
+
+---
+
+## Registration
+
+```csharp
+builder.Services
+    .AddEventBus()                       // in-process EventBus
+    .AddIntegrationEventBus(...)         // optional: Dapr / RabbitMQ
+    .AddMasaDbContext<ShopDbContext>(opts =>
+        opts.UseSqlServer(connStr).UseUoW())
+    .AddDomainEventBus();                // wires DomainEventBus + DomainServices
+```
+
+---
+
+## Code Examples
+
+### 1 — Define a domain event
+
+```csharp
+public record OrderShippedEvent : DomainEvent
+{
+    public Guid OrderId { get; init; }
+    public string TrackingNumber { get; init; } = string.Empty;
+}
+```
+
+### 2 — Raise from an aggregate
+
+```csharp
+public class Order : AggregateRoot<Guid>
+{
+    public string Status { get; private set; } = "Pending";
+
+    public void Ship(string trackingNumber)
+    {
+        if (Status != "Processing")
+            throw new InvalidOperationException("Only processing orders can be shipped.");
+
+        Status = "Shipped";
+        AddDomainEvent(new OrderShippedEvent
+        {
+            OrderId = Id,
+            TrackingNumber = trackingNumber
+        });
+    }
+}
+```
+
+### 3 — Handle with [EventHandler]
+
+```csharp
+public class OrderNotificationHandler
+{
+    private readonly IEmailService _emailService;
+
+    public OrderNotificationHandler(IEmailService emailService)
+        => _emailService = emailService;
+
+    [EventHandler]
+    public async Task NotifyCustomerAsync(OrderShippedEvent @event)
+    {
+        await _emailService.SendShippingNotificationAsync(
+            @event.OrderId,
+            @event.TrackingNumber);
+    }
+}
+```
+
+### 4 — Integration domain event for cross-service scenarios
+
+```csharp
+// Declare the integration domain event
+public record OrderShippedIntegrationEvent : IntegrationDomainEvent
+{
+    public Guid OrderId { get; init; }
+    public string TrackingNumber { get; init; } = string.Empty;
+
+    public override string Topic => "orders.shipped";
+}
+
+// Raise it from the aggregate just like a regular domain event
+public void Ship(string trackingNumber)
+{
+    Status = "Shipped";
+    AddDomainEvent(new OrderShippedIntegrationEvent
+    {
+        OrderId = Id,
+        TrackingNumber = trackingNumber
+    });
+}
+```
+
+<Note>
+  `IntegrationDomainEvent` instances are dispatched in-process via `IEventBus` **and** published to the message broker via `IIntegrationEventBus` within the same `CommitAsync` call. The outbox pattern (if configured) guarantes at-least-once delivery even on process failure.
+</Note>
+
+---
+
+## AuditEntityOptions
+
+Configure the property names used for auditing fields when your database column names differ from the defaults:
+
+```csharp
+builder.Services.Configure<AuditEntityOptions>(options =>
+{
+    options.CreatorFieldName = "CreatedBy";
+    options.ModifierFieldName = "UpdatedBy";
+});
+```

@@ -1,20 +1,91 @@
 ---
-title: "Introduction"
-description: "Welcome to your project"
+title: "MASA Framework: .NET Microservice Framework for Cloud-Native Apps"
+sidebarTitle: "Home"
+description: "MASA Framework is a .NET next-generation microservice development framework providing cloud-native building blocks based on Dapr for distributed, DDD, and SaaS applications."
 ---
 
-Write a short description of your product here. What it does, who it's for, and what they can accomplish with it.
+MASA Framework is a production-ready .NET framework that accelerates microservice development by providing composable building blocks for event-driven communication, caching, DDD patterns, and cloud-native integration with Dapr. Install only the packages you need and wire them together with clean abstractions.
 
-<Tip>
-  Ready to make this your own? Start by editing this page. Update your `docs.json` file to customize your site. Then fill out the [Quickstart](/quickstart) page.
-</Tip>
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Create your first MASA Framework project and get a working microservice running in minutes.
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="/architecture">
+    Understand the Building Blocks and Contrib package structure that powers the framework.
+  </Card>
+  <Card title="Event Bus" icon="bolt" href="/building-blocks/event-bus">
+    Dispatch and handle domain events in-process with a full middleware pipeline.
+  </Card>
+  <Card title="DDD Building Blocks" icon="cubes" href="/ddd/overview">
+    Model your domain with AggregateRoot, Entity, ValueObject, and DomainService abstractions.
+  </Card>
+</CardGroup>
 
-<Card title="Quickstart" icon="rocket" href="/quickstart">
-  This card links to the quickstart page in your project.
-</Card>
-<Card title="Components" icon="puzzle-piece" href="https://mintlify.com/docs/components">
-  Add cards, callouts, steps, tabs, and more to design and structure your pages.
-</Card>
-<Card title="Settings" icon="gear" href="https://mintlify.com/docs/organize/settings">
-  Set your site name, branding, and navigation in the `docs.json` file.
-</Card>
+## What is MASA Framework?
+
+MASA Framework is organized around two layers:
+
+- **BuildingBlocks** — Abstract interfaces and base classes defining the contracts for each capability (caching, events, configuration, etc.)
+- **Contrib** — Concrete implementations using popular libraries like EF Core, Redis, Dapr, and Hangfire
+
+This separation means you can swap implementations without changing your domain logic. Every building block is an independent NuGet package — add only what your service needs.
+
+## Key Capabilities
+
+<CardGroup cols={3}>
+  <Card title="Event Bus" icon="bolt" href="/building-blocks/event-bus">
+    In-process event dispatching with middleware and FluentValidation support
+  </Card>
+  <Card title="Integration Events" icon="arrow-right-arrow-left" href="/building-blocks/integration-events">
+    Cross-service pub/sub messaging via Dapr with outbox pattern support
+  </Card>
+  <Card title="Minimal APIs" icon="code" href="/building-blocks/minimal-apis">
+    Automatic route mapping from service classes with convention-based HTTP method resolution
+  </Card>
+  <Card title="Caching" icon="database" href="/building-blocks/caching">
+    Distributed and multi-level caching with Redis, pub/sub, and key pattern queries
+  </Card>
+  <Card title="DDD Patterns" icon="cubes" href="/ddd/overview">
+    Aggregate roots, domain events, repositories, and domain services
+  </Card>
+  <Card title="EF Core Extensions" icon="table" href="/ddd/ef-core">
+    Soft-delete, auditing, multi-tenancy filters, and Unit of Work built into MasaDbContext
+  </Card>
+  <Card title="Isolation" icon="shield-halved" href="/advanced/isolation">
+    Multi-tenant and multi-environment data isolation with automatic query filtering
+  </Card>
+  <Card title="Configuration" icon="sliders" href="/building-blocks/configuration">
+    Local and remote configuration management with hot-reload support
+  </Card>
+  <Card title="Background Jobs" icon="clock" href="/advanced/background-jobs">
+    Scheduled and queued background jobs via Hangfire or in-memory providers
+  </Card>
+</CardGroup>
+
+## Getting Started
+
+<Steps>
+  <Step title="Install .NET SDK">
+    MASA Framework requires [.NET 6.0 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/6.0) or later.
+  </Step>
+  <Step title="Install the project template">
+    ```bash
+    dotnet new --install Masa.Template
+    ```
+  </Step>
+  <Step title="Create a new project">
+    ```bash
+    dotnet new masafx -o MyMicroservice
+    cd MyMicroservice
+    ```
+  </Step>
+  <Step title="Run the service">
+    ```bash
+    dotnet run
+    ```
+  </Step>
+</Steps>
+
+<Note>
+  For a full walkthrough including package installation and a working event handler, see the [Quickstart guide](/quickstart).
+</Note>

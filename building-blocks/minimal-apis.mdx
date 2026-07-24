@@ -1,0 +1,205 @@
+---
+title: "Minimal APIs with Automatic Route Mapping in MASA Framework"
+sidebarTitle: "Minimal APIs"
+description: "MASA Framework ServiceBase auto-maps public methods to HTTP routes by convention, with configurable prefix, version, pluralization, and HTTP method detection."
+---
+
+MASA Framework's Minimal APIs layer wraps ASP.NET Core's minimal API infrastructure with a convention-driven routing system. Instead of writing individual `app.MapGet(...)` calls for every endpoint, you inherit from `ServiceBase`, name your methods following HTTP-verb prefixes, and let the framework discover and register all routes automatically — including path segmentation, version injection, and optional parameter appending.
+
+## Installation
+
+```bash
+dotnet add package Masa.Contrib.Service.MinimalAPIs
+```
+
+## Setup
+
+Replace the standard `WebApplication.Create` flow with MASA's `AddServices` extension. It scans all assemblies for `ServiceBase` subclasses and returns a configured `WebApplication`:
+
+```csharp
+var builder = WebApplication.CreateBuilder(args);
+
+// AddServices scans assemblies, registers ServiceBase subclasses, and
+// returns the built WebApplication
+var app = builder.AddServices(options =>
+{
+    options.Prefix = "api";
+    options.Version = "v1";
+    options.PluralizeServiceName = true;
+    options.AutoAppendId = true;
+});
+
+app.MapMasaMinimalAPIs();  // materialize all discovered routes
+app.Run();
+```
+
+## Convention-Based HTTP Method Detection
+
+The framework inspects each public method name and maps it to an HTTP verb:
+
+| Method prefix | HTTP verb |
+|---|---|
+| `Get`, `Select`, `Find` | `GET` |
+| `Post`, `Add`, `Create`, `Upsert`, `Insert` | `POST` |
+| `Put`, `Update`, `Modify` | `PUT` |
+| `Delete`, `Remove` | `DELETE` |
+
+Any method whose name doesn't match a known prefix is mapped according to `MapHttpMethodsForUnmatched` (default: `POST`).
+
+## Route Format
+
+Routes follow this pattern:
+
+```
+{Prefix}/{Version}/{ServiceName}/{MethodSuffix}
+```
+
+For a service class named `OrderService` with defaults (`api`, `v1`, pluralized):
+
+| Method | Route |
+|---|---|
+| `GetListAsync()` | `GET /api/v1/orders` |
+| `GetAsync(Guid id)` | `GET /api/v1/orders/{id}` |
+| `AddAsync(...)` | `POST /api/v1/orders` |
+| `DeleteAsync(Guid id)` | `DELETE /api/v1/orders/{id}` |
+
+The framework strips the HTTP-verb prefix from the method name and uses the remainder as the route suffix. A no-suffix method (e.g., `GetAsync`) maps to the service root path. When `AutoAppendId` is `true` and a parameter named `id` exists, `/{id}` is appended automatically.
+
+## Basic Service Example
+
+```csharp
+public class OrderService : ServiceBase
+{
+    // GET /api/v1/orders
+    public async Task<List<Order>> GetListAsync(
+        [FromServices] IOrderRepository repo)
+        => await repo.GetListAsync();
+
+    // GET /api/v1/orders/{id}
+    public async Task<Order?> GetAsync(
+        Guid id,
+        [FromServices] IOrderRepository repo)
+        => await repo.FindAsync(id);
+
+    // POST /api/v1/orders
+    public async Task AddAsync(
+        [FromBody] CreateOrderRequest request,
+        [FromServices] IEventBus eventBus)
+        => await eventBus.PublishAsync(new CreateOrderCommand(request));
+
+    // PUT /api/v1/orders/{id}
+    public async Task UpdateAsync(
+        Guid id,
+        [FromBody] UpdateOrderRequest request,
+        [FromServices] IEventBus eventBus)
+        => await eventBus.PublishAsync(new UpdateOrderCommand(id, request));
+
+    // DELETE /api/v1/orders/{id}
+    public async Task DeleteAsync(Guid id) { }
+}
+```
+
+## Global Route Options (`ServiceGlobalRouteOptions`)
+
+Passed to `AddServices(options => ...)` to set defaults for all services:
+
+| Property | Type | Default | Description |
+|---|---|---|---|
+| `Prefix` | `string` | `"api"` | URL prefix segment |
+| `Version` | `string` | `"v1"` | Version segment |
+| `AutoAppendId` | `bool` | `true` | Appends `/{id}` when an `id` parameter exists |
+| `PluralizeServiceName` | `bool` | `true` | Pluralises `OrderService` → `orders` |
+| `DisableTrimMethodPrefix` | `bool` | `false` | Keeps the HTTP-verb prefix in the route segment |
+| `EnableProperty` | `bool` | `false` | Exposes public properties as additional endpoints |
+| `MapHttpMethodsForUnmatched` | `string[]` | `["POST"]` | Verbs used for prefix-unmatched methods |
+
+## Per-Service Route Options
+
+Each `ServiceBase` subclass can override global options via its `RouteOptions` property:
+
+```csharp
+public class ProductService : ServiceBase
+{
+    public ProductService()
+    {
+        RouteOptions.Prefix = "internal";
+        RouteOptions.Version = "v2";
+        RouteOptions.PluralizeServiceName = false;
+        RouteOptions.AutoAppendId = false;
+        RouteOptions.DisableAutoMapRoute = false;
+    }
+
+    // GET /internal/v2/product/list
+    public Task<List<Product>> GetListAsync() => ...;
+}
+```
+
+## Attribute-Based Route Overrides
+
+### `[RoutePattern]`
+
+Override the generated route for a single method. Set `StartWithBaseUri = true` to prefix with the service's base URI:
+
+```csharp
+public class OrderService : ServiceBase
+{
+    [RoutePattern("/orders/export", StartWithBaseUri = false)]
+    public async Task<FileResult> ExportAsync() => ...;
+
+    [RoutePattern("history", StartWithBaseUri = true)]
+    public async Task<List<Order>> GetHistoryAsync() => ...;
+    // → GET /api/v1/orders/history
+}
+```
+
+### `[IgnoreRoute]`
+
+Exclude a method from auto-registration entirely:
+
+```csharp
+public class OrderService : ServiceBase
+{
+    [IgnoreRoute]
+    public string BuildInternalKey(Guid id) => $"order:{id}";
+}
+```
+
+## Adding Authorization, Rate Limiting, and Filters
+
+`ServiceBase` exposes `RouteHandlerBuilder` — an `Action<RouteHandlerBuilder>` that is applied to every endpoint registered by the service. Use it to attach endpoint metadata:
+
+```csharp
+public class OrderService : ServiceBase
+{
+    public OrderService()
+    {
+        RouteHandlerBuilder = builder => builder
+            .RequireAuthorization()
+            .RequireRateLimiting("fixed");
+    }
+
+    public Task<List<Order>> GetListAsync() => ...;
+    public Task AddAsync([FromBody] CreateOrderRequest req) => ...;
+}
+```
+
+For per-method authorization, use standard ASP.NET Core attributes:
+
+```csharp
+public class OrderService : ServiceBase
+{
+    [Authorize(Roles = "admin")]
+    public Task DeleteAsync(Guid id) { return Task.CompletedTask; }
+}
+```
+
+## Disabling Auto-Mapping
+
+Set `DisableAutoMapRoute = true` on a service to skip all automatic route registration and fall back to manual `app.Map*` calls:
+
+```csharp
+public class LegacyService : ServiceBase
+{
+    public LegacyService() => RouteOptions.DisableAutoMapRoute = true;
+}
+```

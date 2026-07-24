@@ -1,0 +1,243 @@
+---
+title: "EventBus: In-Process Event Dispatching in MASA Framework"
+sidebarTitle: "Event Bus"
+description: "MASA Framework EventBus dispatches domain events in-process with a middleware pipeline, retry support, and FluentValidation integration via IEventHandler."
+---
+
+EventBus is MASA Framework's in-process event dispatching mechanism. It connects event publishers and handlers within the same process boundary, supports ordered multi-handler execution, built-in retry logic, a composable middleware pipeline, and optional FluentValidation integration — making it the foundation for domain-event-driven design in MASA applications.
+
+## Installation
+
+Add the EventBus package to your project:
+
+```bash
+dotnet add package Masa.Contrib.Dispatcher.Events
+```
+
+For FluentValidation support, also install:
+
+```bash
+dotnet add package Masa.Contrib.Dispatcher.Events.FluentValidation
+```
+
+## Registration
+
+Register EventBus in your DI container inside `Program.cs`:
+
+```csharp
+// Scan all assemblies in the current AppDomain
+builder.Services.AddEventBus();
+
+// Or restrict scanning to specific assemblies
+builder.Services.AddEventBus(new[] { typeof(Program).Assembly });
+
+// Fluent configuration with EventBusBuilder
+builder.Services.AddEventBus(builder =>
+{
+    builder.UseMiddleware(typeof(LoggingEventMiddleware<>));
+    builder.UseFluentValidation(typeof(Program).Assembly);
+});
+```
+
+## Defining Events
+
+Every event must implement the `IEvent` marker interface. Using C# records is recommended for immutability:
+
+```csharp
+public record CreateOrderEvent : IEvent
+{
+    public string ProductId { get; init; } = string.Empty;
+    public int Quantity { get; init; }
+}
+```
+
+## Handling Events
+
+### Using `IEventHandler<TEvent>`
+
+Implement the `IEventHandler<TEvent>` interface for a strongly-typed, discoverable handler class:
+
+```csharp
+public class CreateOrderEventHandler : IEventHandler<CreateOrderEvent>
+{
+    private readonly IOrderRepository _repository;
+
+    public CreateOrderEventHandler(IOrderRepository repository)
+        => _repository = repository;
+
+    public async Task HandleAsync(
+        CreateOrderEvent @event,
+        CancellationToken cancellationToken = default)
+    {
+        await _repository.CreateAsync(
+            new Order(@event.ProductId, @event.Quantity),
+            cancellationToken);
+    }
+}
+```
+
+### Using the `[EventHandler]` Attribute
+
+Any public method on a registered class can handle events via the `[EventHandler]` attribute. This approach is useful when a single class hosts multiple handlers for different events:
+
+```csharp
+public class OrderHandler
+{
+    private readonly IOrderRepository _repository;
+    private readonly INotificationService _notifications;
+
+    public OrderHandler(IOrderRepository repository,
+        INotificationService notifications)
+    {
+        _repository = repository;
+        _notifications = notifications;
+    }
+
+    [EventHandler(Order = 1)]
+    public async Task HandleCreateOrderAsync(CreateOrderEvent @event)
+    {
+        await _repository.CreateAsync(new Order(@event.ProductId, @event.Quantity));
+    }
+
+    [EventHandler(Order = 2, EnableRetry = true, RetryTimes = 3)]
+    public async Task NotifyAsync(CreateOrderEvent @event)
+    {
+        // Retried automatically up to 3 times on failure
+        await _notifications.SendAsync($"Order for {@event.ProductId} created.");
+    }
+}
+```
+
+#### `[EventHandler]` Attribute Properties
+
+| Property | Type | Default | Description |
+|---|---|---|---|
+| `Order` | `int` | `0` | Ascending execution order across multiple handlers for the same event |
+| `FailureLevels` | `FailureLevels` | `Throw` | `Throw` re-throws; `ThrowAndCancel` also cancels subsequent handlers |
+| `EnableRetry` | `bool` | `false` | Enables automatic retry on handler exception |
+| `RetryTimes` | `int` | `3` | Maximum retry attempts when `EnableRetry` is true |
+| `IsCancel` | `bool` | `false` | Marks this method as a saga compensation step |
+
+## Publishing Events
+
+Inject `IEventBus` and call `PublishAsync`. The call dispatches the event synchronously through the middleware pipeline before resolving:
+
+```csharp
+public class OrderService : ServiceBase
+{
+    public async Task CreateAsync(
+        [FromBody] CreateOrderEvent @event,
+        [FromServices] IEventBus eventBus)
+        => await eventBus.PublishAsync(@event);
+}
+```
+
+Use `CommitAsync()` when you need to flush any pending unit-of-work changes that handlers may have accumulated:
+
+```csharp
+await eventBus.PublishAsync(@event);
+await eventBus.CommitAsync();
+```
+
+## Saga Compensation with `ISagaEventHandler<TEvent>`
+
+For distributed saga patterns, implement `ISagaEventHandler<TEvent>`. It adds `CancelAsync` alongside `HandleAsync`, which is invoked when a saga step needs to be compensated:
+
+```csharp
+public class ReserveStockSagaHandler : ISagaEventHandler<ReserveStockEvent>
+{
+    public async Task HandleAsync(
+        ReserveStockEvent @event,
+        CancellationToken cancellationToken = default)
+        => await StockService.ReserveAsync(@event.ProductId, @event.Quantity);
+
+    public async Task CancelAsync(
+        ReserveStockEvent @event,
+        CancellationToken cancellationToken = default)
+        => await StockService.ReleaseAsync(@event.ProductId, @event.Quantity);
+}
+```
+
+## Middleware Pipeline
+
+EventBus executes handlers through a middleware pipeline. Each middleware wraps the next handler, enabling cross-cutting concerns such as logging, transactions, and exception handling.
+
+### Built-in Middleware
+
+Two middlewares are registered automatically:
+
+- **`ExceptionEventMiddleware`** — catches exceptions and maps them to `FailureLevels` behavior.
+- **`TransactionEventMiddleware`** — wraps handler execution in a unit-of-work transaction when a `DbContext` is present.
+
+### Custom Middleware
+
+Extend `EventMiddleware<TEvent>` to create your own middleware:
+
+```csharp
+public class LoggingEventMiddleware<TEvent> : EventMiddleware<TEvent>
+    where TEvent : IEvent
+{
+    private readonly ILogger<LoggingEventMiddleware<TEvent>> _logger;
+
+    public LoggingEventMiddleware(ILogger<LoggingEventMiddleware<TEvent>> logger)
+        => _logger = logger;
+
+    // Set SupportRecursive = true if the middleware should apply
+    // even when PublishAsync is called recursively inside a handler
+    public override bool SupportRecursive => false;
+
+    public override async Task HandleAsync(TEvent @event, EventHandlerDelegate next)
+    {
+        _logger.LogInformation("Handling {EventType}", typeof(TEvent).Name);
+        await next();
+        _logger.LogInformation("Finished {EventType}", typeof(TEvent).Name);
+    }
+}
+```
+
+Register your custom middleware during setup:
+
+```csharp
+builder.Services.AddEventBus(builder =>
+    builder.UseMiddleware(typeof(LoggingEventMiddleware<>)));
+```
+
+## Multiple Handlers and Ordering
+
+When multiple handlers exist for the same event, they execute in ascending `Order` value. Handlers at the same order level run in the order they are discovered:
+
+```csharp
+public class OrderAnalyticsHandler
+{
+    [EventHandler(Order = 3)]
+    public async Task RecordAnalyticsAsync(CreateOrderEvent @event)
+    {
+        // Runs after Order = 1 and Order = 2 handlers above
+        await Analytics.TrackAsync("order_created", @event.ProductId);
+    }
+}
+```
+
+## FluentValidation Integration
+
+After installing `Masa.Contrib.Dispatcher.Events.FluentValidation`, register validators and wire them into EventBus:
+
+```csharp
+builder.Services.AddEventBus(builder =>
+    builder.UseFluentValidation(typeof(Program).Assembly));
+```
+
+Define a validator for your event the standard FluentValidation way:
+
+```csharp
+public class CreateOrderEventValidator : AbstractValidator<CreateOrderEvent>
+{
+    public CreateOrderEventValidator()
+    {
+        RuleFor(e => e.ProductId).NotEmpty();
+        RuleFor(e => e.Quantity).GreaterThan(0);
+    }
+}
+```
+
+Validation runs as middleware before any handler is invoked. A validation failure throws a `ValidationException` and halts the pipeline.

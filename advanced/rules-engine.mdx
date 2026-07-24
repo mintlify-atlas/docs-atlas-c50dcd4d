@@ -1,0 +1,189 @@
+---
+title: "Rules Engine: Dynamic Business Rule Evaluation"
+sidebarTitle: "Rules Engine"
+description: "MASA Framework IRulesEngineClient evaluates named rule sets against input data, returning ActionResponse and VerifyResponse results with MicrosoftRulesEngine as the default provider."
+---
+
+MASA Framework's Rules Engine building block externalizes complex business conditions — eligibility checks, pricing tiers, compliance rules — into named rule sets that can be evaluated at runtime without redeploying your service. The default provider is backed by the `RulesEngine` NuGet package from Microsoft, which accepts rules in a declarative workflow JSON format.
+
+## Installation
+
+```bash
+dotnet add package Masa.Contrib.RulesEngine.MicrosoftRulesEngine
+```
+
+This transitively pulls in `Masa.BuildingBlocks.RulesEngine`, which contains the core interfaces.
+
+## Core Abstractions
+
+### `IRulesEngineClient`
+
+The primary interface you inject into your services. It exposes methods to evaluate rule sets and retrieve results:
+
+| Method | Returns | Description |
+|---|---|---|
+| `VerifyAsync(string workflowName, object input)` | `VerifyResponse` | Checks whether the input passes all rules in the named workflow |
+| `ExecuteAsync(string workflowName, object input)` | `ExecuteResponse` | Executes the workflow and returns the raw evaluation output |
+| `ExecuteActionAsync(string workflowName, object input)` | `ActionResponse` | Executes the workflow and returns action results defined in the rule set |
+
+### Response Types
+
+| Type | Key Properties | Use When |
+|---|---|---|
+| `VerifyResponse` | `IsValid`, `Message` | Simple pass/fail decisions — access control, eligibility |
+| `ExecuteResponse` | Rule results per rule name | Debugging; when you need per-rule granularity |
+| `ActionResponse` | Action outputs | When rules trigger side-effect definitions (e.g. set a discount value) |
+
+### Supporting Types
+
+| Type | Description |
+|---|---|
+| `IRulesEngineFactory` | Creates named `IRulesEngineClient` instances for multi-engine scenarios |
+| `RulesEngineClientBase` | Base class for building custom provider implementations |
+| `RulesEngineOptionsBuilder` | Fluent builder for rule configuration during registration |
+| `RulesEngineRelationOptions` | Maps rule workflow names to their backing implementations |
+
+## Registration
+
+```csharp
+builder.Services.AddRulesEngine(rulesBuilder =>
+    rulesBuilder.UseMicrosoftRulesEngine());
+```
+
+The Microsoft Rules Engine provider reads workflow definitions from JSON configuration or in-memory `Workflow` objects — see [microsoft/RulesEngine](https://github.com/microsoft/RulesEngine) for the full workflow JSON schema.
+
+## Defining Rules
+
+Rules are described in the Microsoft Rules Engine workflow JSON format. A workflow groups one or more rules under a named identifier:
+
+```json
+[
+  {
+    "WorkflowName": "DiscountRules",
+    "Rules": [
+      {
+        "RuleName": "SeniorDiscount",
+        "Expression": "input1.Age >= 60"
+      },
+      {
+        "RuleName": "LoyalCustomer",
+        "Expression": "input1.TotalOrders >= 10"
+      }
+    ]
+  }
+]
+```
+
+Store this file (e.g. `rules/discount.json`) and load it during startup, or register workflows programmatically through `RulesEngineOptionsBuilder`.
+
+## Usage
+
+### Basic Verification
+
+```csharp
+builder.Services.AddRulesEngine(rulesBuilder =>
+    rulesBuilder.UseMicrosoftRulesEngine());
+```
+
+```csharp
+public class DiscountService
+{
+    private readonly IRulesEngineClient _rulesEngine;
+
+    public DiscountService(IRulesEngineClient rulesEngine)
+        => _rulesEngine = rulesEngine;
+
+    public async Task<bool> IsEligibleForDiscountAsync(Customer customer)
+    {
+        var result = await _rulesEngine.VerifyAsync(
+            "DiscountRules",
+            new { customer.Age, customer.TotalOrders });
+
+        return result.IsValid;
+    }
+}
+```
+
+### Handling the Verification Response
+
+`VerifyResponse` carries a `Message` when validation fails, which is useful for returning human-readable feedback:
+
+```csharp
+public async Task<IActionResult> ApplyDiscountAsync(Customer customer)
+{
+    var result = await _rulesEngine.VerifyAsync(
+        "DiscountRules",
+        new { customer.Age, customer.TotalOrders });
+
+    if (!result.IsValid)
+    {
+        return BadRequest(new { error = result.Message });
+    }
+
+    // apply discount
+    return Ok();
+}
+```
+
+### Action-Based Rules
+
+When rules include action definitions (e.g. returning a computed discount percentage), use `ExecuteActionAsync`:
+
+```csharp
+public async Task<decimal> GetDiscountRateAsync(Customer customer)
+{
+    var response = await _rulesEngine.ExecuteActionAsync(
+        "DiscountRateRules",
+        new { customer.Age, customer.TotalOrders, customer.Tier });
+
+    // ActionResponse output is a dictionary keyed by rule name
+    if (response.Output is decimal rate)
+        return rate;
+
+    return 0m;
+}
+```
+
+## Multiple Rule Engines
+
+Use `IRulesEngineFactory` when different subsystems require separate engine configurations or rule stores:
+
+```csharp
+public class PricingService
+{
+    private readonly IRulesEngineClient _pricingEngine;
+
+    public PricingService(IRulesEngineFactory factory)
+        => _pricingEngine = factory.Create("PricingEngine");
+}
+```
+
+Register named engines through `RulesEngineRelationOptions` during startup to map engine names to their respective configurations.
+
+## Custom Provider
+
+Extend `RulesEngineClientBase` to integrate a different rule evaluation backend while keeping the same `IRulesEngineClient` injection contract across your codebase:
+
+```csharp
+public class MyCustomRulesEngineClient : RulesEngineClientBase
+{
+    protected override Task<VerifyResponse> VerifyCoreAsync(
+        string workflowName,
+        object input,
+        CancellationToken cancellationToken)
+    {
+        // delegate to your custom engine
+    }
+}
+```
+
+Register it via `RulesEngineOptionsBuilder`:
+
+```csharp
+builder.Services.AddRulesEngine(rulesBuilder =>
+    rulesBuilder.UseCustomEngine<MyCustomRulesEngineClient>());
+```
+
+<Tip>
+  Keep rule workflow JSON files in a configuration store (DCC, Azure App Configuration, etc.) rather than embedded in the binary. This lets business analysts update rules without requiring a code deployment.
+</Tip>

@@ -1,0 +1,159 @@
+---
+title: "Multi-Tenant and Multi-Environment Isolation in MASA Framework"
+sidebarTitle: "Isolation"
+description: "MASA Framework Isolation provides automatic multi-tenant and multi-environment data partitioning with middleware-based context resolution and EF Core query filters."
+---
+
+MASA Framework's Isolation building block enables your services to serve multiple tenants and environments from a single deployment. By combining middleware-based context resolution with automatic EF Core query filters, tenant and environment boundaries are enforced transparently — your business logic stays clean while data partitioning happens at the infrastructure layer.
+
+## Installation
+
+Install the core package plus whichever isolation strategies you need:
+
+```bash
+dotnet add package Masa.Contrib.Isolation
+dotnet add package Masa.Contrib.Isolation.MultiTenant      # tenant isolation
+dotnet add package Masa.Contrib.Isolation.MultiEnvironment # environment isolation
+```
+
+## Core Abstractions
+
+The `IIsolation<TKey>` interface is the combined contract that extends both `IMultiTenant<TKey>` and `IMultiEnvironment`. A convenience alias `IIsolation` binds `TKey` to `Guid`, which covers the most common scenario:
+
+| Interface | Description |
+|---|---|
+| `IMultiTenant<TKey>` | Carries the tenant identifier of type `TKey` |
+| `IMultiEnvironment` | Carries the current environment name |
+| `IIsolation<TKey>` | Combines both; shorthand `IIsolation` = `IIsolation<Guid>` |
+
+## Multi-Tenant Components
+
+`Masa.Contrib.Isolation.MultiTenant` ships the following building blocks for resolving the active tenant on every request:
+
+<AccordionGroup>
+  <Accordion title="MultiTenantMiddleware">
+    ASP.NET Core middleware that inspects each incoming HTTP request and extracts the tenant ID from the configured source — HTTP header, query string, or route value — then stores it in `MultiTenantContext` for the duration of the request.
+  </Accordion>
+  <Accordion title="MultiTenantContext">
+    A scoped context object that holds the resolved tenant information. Inject it wherever you need to read the current tenant within a request.
+  </Accordion>
+  <Accordion title="MultiTenantOptions">
+    Configuration object that controls how the tenant ID is parsed — which header name, query parameter, or route segment to inspect.
+  </Accordion>
+  <Accordion title="CurrentUserTenantParseProvider">
+    An alternative parse provider that resolves the tenant from the authenticated user's claims, useful when users are permanently bound to a tenant.
+  </Accordion>
+</AccordionGroup>
+
+## Multi-Environment Components
+
+`Masa.Contrib.Isolation.MultiEnvironment` provides symmetric support for environment-aware routing:
+
+<AccordionGroup>
+  <Accordion title="MultiEnvironmentMiddleware">
+    Extracts the target environment name from the incoming request and populates `MultiEnvironmentContext`.
+  </Accordion>
+  <Accordion title="MultiEnvironmentContext">
+    Scoped context that exposes the current environment name throughout the request pipeline.
+  </Accordion>
+  <Accordion title="CurrentUserEnvironmentParseProvider">
+    Resolves the environment from user claims, allowing per-user environment pinning.
+  </Accordion>
+  <Accordion title="MasaAppConfigureParserProvider">
+    Reads the environment from the application's own configuration, acting as a fallback when the request carries no explicit environment signal.
+  </Accordion>
+</AccordionGroup>
+
+## Registration
+
+Use `IIsolationBuilder` for fluent configuration during startup, then activate the middleware in your request pipeline:
+
+```csharp
+// Program.cs — service registration
+builder.Services.AddIsolation(isolationBuilder =>
+{
+    isolationBuilder.UseMultiTenant();
+    isolationBuilder.UseMultiEnvironment();
+});
+
+// Program.cs — middleware (order matters: place before MVC/routing)
+app.UseIsolation();
+```
+
+<Tip>
+  Call `UseIsolation()` **before** `app.UseRouting()` and `app.UseAuthentication()` so that the tenant and environment contexts are resolved before any subsequent middleware reads them.
+</Tip>
+
+## Marking Entities
+
+To participate in automatic query filtering, your EF Core entities must implement the appropriate isolation interface. The framework then applies global query filters so that queries only return rows belonging to the current tenant or environment — no extra `Where` clauses required in your repositories.
+
+```csharp
+// Entity that belongs to a specific tenant
+public class Product : AggregateRoot<Guid>, IMultiTenant<Guid>
+{
+    public Guid TenantId { get; set; }
+    public string Name { get; set; } = string.Empty;
+}
+```
+
+For environment-scoped entities implement `IMultiEnvironment`, and for entities that require both simply implement `IIsolation<Guid>`:
+
+```csharp
+// Entity scoped to both a tenant and an environment
+public class FeatureFlag : AggregateRoot<Guid>, IIsolation<Guid>
+{
+    public Guid TenantId { get; set; }
+    public string Environment { get; set; } = string.Empty;
+    public string FlagName { get; set; } = string.Empty;
+    public bool IsEnabled { get; set; }
+}
+```
+
+## EventBus Integration
+
+When your application uses the MASA EventBus, isolation context must flow across event boundaries. `IsolationEventMiddleware` is an EventBus middleware that automatically propagates the current tenant ID and environment name into outbound events and restores them when handling inbound events — ensuring consistency in event-driven workflows without any manual context forwarding.
+
+```csharp
+builder.Services.AddEventBus(eventBusBuilder =>
+{
+    // IsolationEventMiddleware is registered automatically
+    // when AddIsolation is called before AddEventBus
+    eventBusBuilder.UseMiddleware(typeof(IsolationEventMiddleware));
+});
+```
+
+## EF Core Query Filters
+
+Once your `DbContext` is configured with the MASA EF Core integration and your entities implement the isolation interfaces, global query filters are applied automatically:
+
+```csharp
+public class CatalogDbContext : MasaDbContext<CatalogDbContext>
+{
+    public CatalogDbContext(MasaDbContextOptions<CatalogDbContext> options)
+        : base(options) { }
+
+    public DbSet<Product> Products => Set<Product>();
+}
+```
+
+<Info>
+  The automatic query filter reads the tenant ID and environment name from the ambient `MultiTenantContext` / `MultiEnvironmentContext` at query time. If no context is set (e.g. in a background job), the filter is bypassed — ensure you seed isolation context explicitly in those scenarios.
+</Info>
+
+## How It Works End-to-End
+
+<Steps>
+  <Step title="Request arrives">
+    `MultiTenantMiddleware` and/or `MultiEnvironmentMiddleware` inspect the request and populate the scoped context objects.
+  </Step>
+  <Step title="Business logic executes">
+    Services and repositories operate normally. Injected `DbContext` instances transparently apply query filters based on the ambient context.
+  </Step>
+  <Step title="Events are published">
+    `IsolationEventMiddleware` captures the current isolation context and embeds it in the event metadata.
+  </Step>
+  <Step title="Event is consumed">
+    The consumer side middleware restores the isolation context before the event handler runs, preserving tenant and environment boundaries across service boundaries.
+  </Step>
+</Steps>

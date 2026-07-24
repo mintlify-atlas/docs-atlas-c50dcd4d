@@ -1,0 +1,179 @@
+---
+title: "Distributed Lock: Cross-Instance Locking in MASA Framework"
+sidebarTitle: "Distributed Lock"
+description: "MASA Framework distributed lock provides IDistributedLock with local (in-process), database (MySQL, SQL Server), Azure Blob, and file-system backends via Medallion."
+---
+
+Coordinating concurrent access to shared resources across multiple service instances is a foundational challenge in microservice architectures. MASA Framework's distributed lock abstraction exposes a single `IDistributedLock` interface and lets you swap between an in-process lock for single-instance deployments and robust, externally-coordinated locks backed by MySQL, Azure Blob Storage, or the file system — all without changing your application code.
+
+## Available Packages
+
+Choose the backend that matches your deployment topology:
+
+| Package | Backend | Best For |
+|---|---|---|
+| `Masa.Contrib.Data.DistributedLock.Local` | `SemaphoreSlim` (in-process) | Single-instance / unit-testing |
+| `Masa.Contrib.Data.DistributedLock.Medallion.MySql` | MySQL advisory locks | Multi-instance, relational DB stack |
+| `Masa.Contrib.Data.DistributedLock.Medallion.SqlServer` | SQL Server app locks | Multi-instance, SQL Server stack |
+| `Masa.Contrib.Data.DistributedLock.Medallion.Azure` | Azure Blob leases | Multi-instance, Azure-hosted workloads |
+| `Masa.Contrib.Data.DistributedLock.Medallion.FileSystem` | File-system locks | Multi-process on a single shared volume |
+
+Install only the package for your chosen backend:
+
+```bash
+# Local (in-process) lock
+dotnet add package Masa.Contrib.Data.DistributedLock.Local
+
+# MySQL distributed lock
+dotnet add package Masa.Contrib.Data.DistributedLock.Medallion.MySql
+
+# Azure Blob distributed lock
+dotnet add package Masa.Contrib.Data.DistributedLock.Medallion.Azure
+
+# File-system distributed lock
+dotnet add package Masa.Contrib.Data.DistributedLock.Medallion.FileSystem
+```
+
+## Core Abstractions
+
+### `IDistributedLock`
+
+The primary interface your application code depends on. It provides a single async method to acquire a named lock and returns a disposable handle:
+
+```csharp
+public interface IDistributedLock
+{
+    Task<IDistributedLockHandle?> AcquireAsync(
+        string resource,
+        TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default);
+}
+```
+
+A `null` return value indicates that the lock could not be acquired within the specified timeout — your code must handle this case explicitly.
+
+### `DefaultLocalDistributedLock`
+
+The local implementation wraps a `SemaphoreSlim` keyed by resource name. It is safe for concurrent access within a single process and is ideal for integration tests or single-replica deployments where external coordination is unnecessary.
+
+### `MedallionBuilderExtensions`
+
+Extension methods that configure the Medallion.Threading provider for each supported backend. Medallion.Threading is a battle-tested .NET distributed locking library; MASA wraps it behind `IDistributedLock` so you can switch backends via DI registration only.
+
+### `DisposeAction`
+
+An internal helper used by all implementations to release the underlying lock when the caller disposes the handle. The `await using` pattern ensures release even in the presence of exceptions.
+
+## Registration
+
+### Local lock (single process)
+
+```csharp
+builder.Services.AddDistributedLock(options => options.UseLocal());
+```
+
+### MySQL distributed lock
+
+```csharp
+var connectionString = builder.Configuration.GetConnectionString("Default");
+
+builder.Services.AddDistributedLock(options =>
+    options.UseMedallion(medallion =>
+        medallion.UseMySql(connectionString)));
+```
+
+### SQL Server distributed lock
+
+```csharp
+builder.Services.AddDistributedLock(options =>
+    options.UseMedallion(medallion =>
+        medallion.UseSqlServer(connectionString)));
+```
+
+### Azure Blob distributed lock
+
+```csharp
+var blobConnectionString = builder.Configuration["Azure:BlobStorage"];
+
+builder.Services.AddDistributedLock(options =>
+    options.UseMedallion(medallion =>
+        medallion.UseAzure(blobConnectionString)));
+```
+
+### File-system distributed lock
+
+```csharp
+builder.Services.AddDistributedLock(options =>
+    options.UseMedallion(medallion =>
+        medallion.UseFileSystem(directoryPath: "/var/locks")));
+```
+
+## Usage Pattern
+
+Inject `IDistributedLock` into any service and acquire a named lock before entering a critical section. Use `await using` to guarantee the lock is released:
+
+```csharp
+public class InventoryService
+{
+    private readonly IDistributedLock _lock;
+
+    public InventoryService(IDistributedLock @lock) => _lock = @lock;
+
+    public async Task DeductStockAsync(string productId, int qty)
+    {
+        await using var handle = await _lock.AcquireAsync(
+            resource: $"inventory:{productId}",
+            timeout: TimeSpan.FromSeconds(5));
+
+        // handle is null if the lock could not be acquired within the timeout
+        if (handle == null)
+            throw new InvalidOperationException(
+                $"Could not acquire lock for product '{productId}'. Try again shortly.");
+
+        // Only one instance reaches this line at a time per productId
+        // ... safe to read-modify-write stock levels ...
+    }
+}
+```
+
+<Note>
+  Name your lock resources with a meaningful prefix (e.g. `inventory:`, `order:`) to avoid accidental collisions between unrelated parts of your application. Resource names are arbitrary strings — choose a consistent naming convention across your team.
+</Note>
+
+## Choosing the Right Backend
+
+```
+Single process or tests
+    └─ UseLocal()
+
+Multi-instance + existing relational DB
+    ├─ MySQL  → UseMedallion(m => m.UseMySql(...))
+    └─ SQL Server → UseMedallion(m => m.UseSqlServer(...))
+
+Multi-instance + Azure hosting
+    └─ UseMedallion(m => m.UseAzure(...))
+
+Multi-process on shared volume (e.g. NFS, ephemeral containers)
+    └─ UseMedallion(m => m.UseFileSystem(...))
+```
+
+Because all backends are registered behind the same `IDistributedLock` interface, you can start with `UseLocal()` during local development and switch to a Medallion backend for staging and production by changing only the DI registration — no application code changes required.
+
+## Timeout and Cancellation
+
+All `AcquireAsync` calls accept an optional `timeout` and `CancellationToken`. If neither is provided, the call blocks indefinitely until the lock is available:
+
+```csharp
+// Wait at most 2 seconds, also honour request cancellation
+await using var handle = await _lock.AcquireAsync(
+    resource: "critical-section",
+    timeout: TimeSpan.FromSeconds(2),
+    cancellationToken: cancellationToken);
+
+if (handle == null)
+{
+    // Lock contended — back off or return a 429
+}
+```
+
+Prefer always passing a finite timeout in production to avoid unbounded waits under high contention.

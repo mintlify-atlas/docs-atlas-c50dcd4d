@@ -1,0 +1,192 @@
+---
+title: "Object Storage: Cloud File Upload and Download"
+sidebarTitle: "Object Storage"
+description: "MASA Framework IObjectStorageClient provides bucket-based file upload, download, delete, and temporary credential generation with provider-swappable storage backends."
+---
+
+MASA Framework's Object Storage building block wraps cloud blob storage behind a provider-agnostic interface. Your service code calls `IObjectStorageClient` methods — upload, download, delete, check existence — and the underlying cloud provider (Alibaba OSS, AWS S3, Azure Blob, etc.) is swapped in through the registration layer without touching a single line of business logic.
+
+## Installation
+
+```bash
+dotnet add package Masa.BuildingBlocks.Storage.ObjectStorage  # core interface
+dotnet add package Masa.Contrib.Storage.ObjectStorage.Aliyun  # Alibaba OSS provider
+```
+
+Replace the provider package with whichever backend your infrastructure uses.
+
+## Core Interface: `IObjectStorageClient`
+
+Inject `IObjectStorageClient` to interact with object storage. The full method surface is:
+
+| Method | Returns | Description |
+|---|---|---|
+| `GetObjectAsync(bucket, objectName, callback)` | `Task` | Stream the full object to a callback |
+| `GetObjectAsync(bucket, objectName, offset, length, callback)` | `Task` | Stream a byte range of the object |
+| `PutObjectAsync(bucket, objectName, stream)` | `Task` | Upload an object from a stream |
+| `ObjectExistsAsync(bucket, objectName)` | `Task<bool>` | Check if an object exists |
+| `DeleteObjectAsync(bucket, objectName)` | `Task` | Delete a single object |
+| `DeleteObjectsAsync(bucket, objectNames)` | `Task` | Batch delete multiple objects |
+| `GetObjectMetadataAsync(bucket, objectName)` | `Task<...>` | Retrieve object metadata (content type, size, ETag, etc.) |
+| `GetSecurityToken()` | `TemporaryCredentialsResponse` | Obtain short-lived STS credentials for client-side uploads |
+| `GetToken()` | `string` | Obtain a pre-signed URL or access token |
+
+## Supporting Types
+
+| Type | Description |
+|---|---|
+| `IObjectStorageClientFactory` | Creates named `IObjectStorageClient` instances for multi-bucket or multi-provider setups |
+| `AbstractStorageClient` | Base class; override to implement a custom provider |
+| `IManualObjectStorageClient` | Low-level interface that `AbstractStorageClient` implements |
+| `BucketNameAttribute` | Annotate a class to bind it to a specific bucket name |
+| `BucketNameProvider` | Resolves the bucket name for a given type at runtime |
+| `BucketNames` | Registry that maps type names to bucket names |
+| `TemporaryCredentialsResponse` | STS credential payload returned by `GetSecurityToken()` |
+
+## Registration
+
+```csharp
+builder.Services.AddObjectStorage(options =>
+    options.UseAliyunStorage());
+```
+
+Provider-specific configuration (endpoint, access key, secret) is typically read from `appsettings.json` or environment variables. Refer to the chosen provider package's README for its configuration schema.
+
+## Basic Usage
+
+```csharp
+public class FileService
+{
+    private readonly IObjectStorageClient _storage;
+
+    public FileService(IObjectStorageClient storage) => _storage = storage;
+
+    public async Task UploadAsync(string fileName, Stream content)
+        => await _storage.PutObjectAsync("my-bucket", fileName, content);
+
+    public async Task DownloadAsync(string fileName, Action<Stream> handler)
+        => await _storage.GetObjectAsync("my-bucket", fileName, handler);
+
+    public async Task<bool> ExistsAsync(string fileName)
+        => await _storage.ObjectExistsAsync("my-bucket", fileName);
+
+    public async Task DeleteAsync(string fileName)
+        => await _storage.DeleteObjectAsync("my-bucket", fileName);
+}
+```
+
+## Partial / Range Downloads
+
+For large files, download only the bytes you need by specifying an `offset` and `length`:
+
+```csharp
+// Download bytes 0–4095 (the first 4 KB) of a file
+await _storage.GetObjectAsync(
+    "my-bucket",
+    "large-video.mp4",
+    offset: 0,
+    length: 4096,
+    callback: stream =>
+    {
+        // process the partial stream
+    });
+```
+
+## Batch Delete
+
+Remove multiple objects in a single API call to reduce round-trips:
+
+```csharp
+var staleFiles = new[]
+{
+    "exports/report-2023-01.csv",
+    "exports/report-2023-02.csv",
+    "exports/report-2023-03.csv"
+};
+
+await _storage.DeleteObjectsAsync("my-bucket", staleFiles);
+```
+
+## Temporary Credentials for Client-Side Uploads
+
+Generating short-lived STS credentials lets front-end clients upload directly to object storage without routing large payloads through your service:
+
+```csharp
+[ApiController]
+[Route("storage")]
+public class StorageController : ControllerBase
+{
+    private readonly IObjectStorageClient _storage;
+
+    public StorageController(IObjectStorageClient storage) => _storage = storage;
+
+    [HttpGet("credentials")]
+    public IActionResult GetUploadCredentials()
+    {
+        var credentials = _storage.GetSecurityToken();
+        return Ok(credentials); // return to client; expires per STS policy
+    }
+}
+```
+
+## Bucket Binding with `BucketNameAttribute`
+
+Avoid scattering hardcoded bucket name strings throughout your codebase by binding a marker class to a bucket:
+
+```csharp
+[BucketName("product-images")]
+public class ProductImagesBucket { }
+
+public class ProductImageService
+{
+    private readonly IObjectStorageClient _storage;
+    private readonly BucketNameProvider _bucketNames;
+
+    public ProductImageService(
+        IObjectStorageClient storage,
+        BucketNameProvider bucketNames)
+    {
+        _storage = storage;
+        _bucketNames = bucketNames;
+    }
+
+    public async Task UploadImageAsync(string fileName, Stream image)
+    {
+        var bucket = _bucketNames.GetBucketName<ProductImagesBucket>();
+        await _storage.PutObjectAsync(bucket, fileName, image);
+    }
+}
+```
+
+## Multiple Storage Backends
+
+When your application needs to talk to more than one storage provider or bucket configuration, use `IObjectStorageClientFactory` to retrieve named clients:
+
+```csharp
+public class MultiStorageService
+{
+    private readonly IObjectStorageClient _primary;
+    private readonly IObjectStorageClient _archive;
+
+    public MultiStorageService(IObjectStorageClientFactory factory)
+    {
+        _primary = factory.Create("Primary");
+        _archive = factory.Create("Archive");
+    }
+
+    public async Task ArchiveAsync(string objectName)
+    {
+        // Download from primary, upload to archive
+        await _primary.GetObjectAsync("live-bucket", objectName, async stream =>
+        {
+            await _archive.PutObjectAsync("archive-bucket", objectName, stream);
+        });
+
+        await _primary.DeleteObjectAsync("live-bucket", objectName);
+    }
+}
+```
+
+<Tip>
+  Always dispose or fully consume the stream inside the `GetObjectAsync` callback before returning. The framework closes the underlying HTTP response stream when the callback returns, so keeping a reference to the stream after the callback exits will result in an `ObjectDisposedException`.
+</Tip>
